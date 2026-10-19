@@ -240,18 +240,34 @@ final class NativePlayback: Playback {
     private var outFormat: CMVideoFormatDescription?
     private var inflight = 0                       // handed to the decoder, not out yet (this generation)
     private var queued: [Int64] = []               // pts of pictures the layer holds that aren't on screen yet
+    // The decoder can hand B-frames back out of display order, and the layer drops a picture that arrives
+    // behind a later one (15% of frames at 4x on H.264). Pictures wait here until nothing earlier is still out.
+    private var outstanding: [Int64] = []          // pts of frames handed to the decoder, not out yet
+    private var reorder: [(pts: Int64, time: CMTime, image: CVImageBuffer)] = []
     private var pumpPending = false
     private var audioTraced = -1
+    private var targetQueuedGen = -1               // generation whose exact-seek target has reached the layer
     private var sessionBroken = false
     private let fps: Double
+    /// Constant-rate video stored with coarse timestamps (Matroska's are whole milliseconds: 33, 34, 33…)
+    /// gets presentation times on an even grid; at 4x the uneven ones beat against a 120 Hz display.
+    private let grid: (first: Int64, step: Double)?
 
     var layer: CALayer { display }
 
     init(index: MediaIndex, audio source: AudioSource?) {
         self.index = index
         duration = index.duration
-        fps = 1 / max(index.frameDuration, 0.001)
         audioSource = source
+        let n = index.byPTS.count
+        let first = index.samples[Int(index.byPTS[0])].pts
+        let step = n > 1 ? Double(index.samples[Int(index.byPTS[n - 1])].pts - first) / Double(n - 1) : 0
+        // constant rate: every timestamp within a quarter frame of the grid (checked over the first 600)
+        let cfr = step > 0 && (0..<min(n, 600)).allSatisfy {
+            abs(Double(index.samples[Int(index.byPTS[$0])].pts - first) - Double($0) * step) < step / 4
+        }
+        grid = cfr ? (first, step) : nil
+        fps = cfr ? Double(index.timescale) / step : 1 / max(index.frameDuration, 0.001)
         display.videoGravity = .resizeAspect
         audio.audioTimePitchAlgorithm = .spectral
         sync.addRenderer(display.sampleBufferRenderer)
@@ -405,6 +421,9 @@ final class NativePlayback: Playback {
             hideBefore = targetPTS
             inflight = 0
             queued = []
+            outstanding = []
+            reorder = []
+            pumpPending = false
             if sessionBroken { dropSession() }
             let at = Double(targetPTS) / Double(index.timescale) - 0.05
             audioSource?.reset(at: at)
@@ -418,9 +437,10 @@ final class NativePlayback: Playback {
         guard g == gen else { DispatchQueue.main.async { completion(false) }; return }
         let shown: Bool
         if #available(macOS 14.4, *) {
-            shown = flushedGen == g && display.sampleBufferRenderer.displayedPixelBuffer() != nil
+            // the target itself must have been queued: right after a flush the layer can still hand out the old picture
+            shown = flushedGen == g && targetQueuedGen == g && display.sampleBufferRenderer.displayedPixelBuffer() != nil
         }
-        else { shown = CACurrentMediaTime() > deadline - 1.85 }
+        else { shown = targetQueuedGen == g && CACurrentMediaTime() > deadline - 1.85 }
         if shown || CACurrentMediaTime() > deadline {
             DispatchQueue.main.async { completion(true) }
             return
@@ -428,8 +448,8 @@ final class NativePlayback: Playback {
         q.asyncAfter(deadline: .now() + 0.004) { [weak self] in self?.waitForPicture(g, deadline: deadline, completion) }
     }
 
-    /// How many pictures to keep decoded ahead: ~0.12 s of video at the current speed, at least 4.
-    private var lead: Int { max(4, Int((0.12 * Double(max(rate, 1)) * fps).rounded(.up))) }
+    /// How many pictures to keep decoded ahead: ~0.1 s of video at the current speed, at least 4.
+    private var lead: Int { max(4, Int((0.1 * Double(max(rate, 1)) * fps).rounded(.up))) }
 
     private func dropSession() {
         if let s = session { VTDecompressionSessionInvalidate(s) }
@@ -451,60 +471,83 @@ final class NativePlayback: Playback {
 
     /// Keep `lead` pictures decoded ahead of the clock. Frames before an exact-seek target are decoded for
     /// their references only (and skipped entirely when nothing references them).
-    private func pump(_ g: Int) {
-        pumpPending = false
+    private func pump(_ g: Int, timer: Bool = false) {
+        if timer { pumpPending = false }
         guard g == gen, !isSuspended else { return }
         if session == nil { session = makeSession() }
         guard let s = session else { return }
         let now = Int64((sync.currentTime().seconds * Double(index.timescale)).rounded(.down))
         queued.removeAll { $0 <= now }
-        while vNext < index.samples.count && queued.count + inflight < lead {
+        while vNext < index.samples.count && queued.count + reorder.count + inflight < lead {
             let d = vNext
             let smp = index.samples[d]
             vNext += 1
             if smp.pts < hideBefore && index.isDroppable(d) { continue }
             guard let sb = index.sampleBuffer(d) else { continue }
             inflight += 1
-            let st = VTDecompressionSessionDecodeFrame(s, sampleBuffer: sb, flags: [._EnableAsynchronousDecompression, ._EnableTemporalProcessing],
+            let fed = smp.pts
+            outstanding.append(fed)
+            let st = VTDecompressionSessionDecodeFrame(s, sampleBuffer: sb, flags: [._EnableAsynchronousDecompression],
                                                        infoFlagsOut: nil) { [weak self] status, _, image, t, _ in
-                self?.q.async { self?.decoded(g, status, image, t) }
+                self?.q.async { self?.decoded(g, fed, status, image, t) }
             }
-            if st != noErr { inflight -= 1; sessionBroken = true }
+            if st != noErr { inflight -= 1; sessionBroken = true; outstanding.removeLast() }
         }
         if vNext >= index.samples.count { VTDecompressionSessionFinishDelayedFrames(s) }
         // playing: come back once about half the queue has been shown
         if sync.rate > 0 && !pumpPending && vNext < index.samples.count {
             pumpPending = true
             let wait = Double(max(1, lead / 2)) / fps / Double(sync.rate)
-            q.asyncAfter(deadline: .now() + wait) { [weak self] in self?.pump(g) }
+            q.asyncAfter(deadline: .now() + wait) { [weak self] in self?.pump(g, timer: true) }
         }
     }
 
-    private func decoded(_ g: Int, _ status: OSStatus, _ image: CVImageBuffer?, _ t: CMTime) {
+    private func decoded(_ g: Int, _ fed: Int64, _ status: OSStatus, _ image: CVImageBuffer?, _ t: CMTime) {
         guard g == gen else { return }
         inflight = max(0, inflight - 1)
+        if let i = outstanding.firstIndex(of: fed) { outstanding.remove(at: i) }
         if status != noErr { sessionBroken = true }
-        let p = t.convertScale(index.timescale, method: .roundHalfAwayFromZero).value
-        if status == noErr, let image, p >= hideBefore {
-            if outFormat == nil || !CMVideoFormatDescriptionMatchesImageBuffer(outFormat!, imageBuffer: image) {
-                var f: CMVideoFormatDescription?
-                CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: image, formatDescriptionOut: &f)
-                outFormat = f
-            }
-            var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: CMTimeScale(max(1, fps.rounded()))),
-                                            presentationTimeStamp: t, decodeTimeStamp: .invalid)
-            var sb: CMSampleBuffer?
-            if let f = outFormat {
-                CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: image, formatDescription: f,
-                                                         sampleTiming: &timing, sampleBufferOut: &sb)
-            }
-            if let sb {
-                if sync.rate > 0, CMTimeCompare(t, sync.currentTime()) < 0 { Trace.log("late \(p)") }
-                display.sampleBufferRenderer.enqueue(sb)
-                queued.append(p)
-            }
+        if status == noErr, let image, fed >= hideBefore {
+            let at = reorder.firstIndex { $0.pts > fed } ?? reorder.count
+            reorder.insert((fed, t, image), at: at)
         }
-        if !pumpPending { pump(g) }
+        // release, in display order, every picture nothing still in the decoder (or about to go in: B-frames
+        // follow the frame they show before, within a few frames) can come before
+        var floor = outstanding.min() ?? .max
+        for d in vNext..<min(vNext + 16, index.samples.count) { floor = min(floor, index.samples[d].pts) }
+        while let first = reorder.first, first.pts < floor {
+            reorder.removeFirst()
+            show(first.image, at: first.time, pts: first.pts, g)
+        }
+        // every output frees a slot: refill now (frames before a seek target decode back to back,
+        // not at the playback pace)
+        pump(g)
+    }
+
+    private func show(_ image: CVImageBuffer, at t: CMTime, pts p: Int64, _ g: Int) {
+        if outFormat == nil || !CMVideoFormatDescriptionMatchesImageBuffer(outFormat!, imageBuffer: image) {
+            var f: CMVideoFormatDescription?
+            CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: image, formatDescriptionOut: &f)
+            outFormat = f
+        }
+        var t = t
+        if let g = grid {
+            let k = (Double(p - g.first) / g.step).rounded()
+            t = CMTime(seconds: (Double(g.first) + k * g.step) / Double(index.timescale), preferredTimescale: 1_000_000)
+        }
+        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: CMTimeScale(max(1, fps.rounded()))),
+                                        presentationTimeStamp: t, decodeTimeStamp: .invalid)
+        var sb: CMSampleBuffer?
+        if let f = outFormat {
+            CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: image, formatDescription: f,
+                                                     sampleTiming: &timing, sampleBufferOut: &sb)
+        }
+        guard let sb else { return }
+        if sync.rate > 0, CMTimeCompare(t, sync.currentTime()) < 0 { Trace.log("late \(p)") }
+        if let l = queued.last, p <= l { Trace.log("ooo \(p) after \(l)") }
+        display.sampleBufferRenderer.enqueue(sb)
+        queued.append(p)
+        targetQueuedGen = g
     }
 
     private func feedAudio(_ g: Int) {
