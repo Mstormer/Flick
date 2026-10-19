@@ -238,6 +238,8 @@ final class FrameCache {
 
     func peek(_ k: Int) -> CVPixelBuffer? { map[k]?.0 }
 
+    func removeAll() { map = [:]; bytes = 0 }
+
     func get(_ k: Int) -> CVPixelBuffer? {
         guard let e = map[k] else { return nil }
         tick += 1; map[k] = (e.0, tick)
@@ -268,7 +270,7 @@ final class ScrubEngine {
     var onFail: ((Int) -> Void)?
 
     private let lock = NSLock()
-    private var target = 0                 // decode index we want on screen
+    private var target = -1               // decode index we want on screen (-1: nothing asked for yet)
     private var gen = 0
     private var prefetchList: [Int] = []   // frames worth decoding ahead of time while idle
     private var idle = false               // player paused: the decoder is ours to use in the background
@@ -411,9 +413,11 @@ final class ScrubEngine {
     }
 
     /// Allow background decoding (only while the player is paused, so playback never loses the decoder).
+    /// Playback starting empties the cache: its 4K frames sit in the system decoder's memory (~12 MB
+    /// each) and nothing uses them while playing. Pausing fills it again.
     func setIdle(_ on: Bool) {
         lock.lock(); idle = on; lock.unlock()
-        if on { wake.signal() }
+        if on { wake.signal() } else { outLock.lock(); cache.removeAll(); outLock.unlock() }
     }
 
     private func nextPrefetch() -> Int? {
@@ -424,6 +428,7 @@ final class ScrubEngine {
         // Then warm the keyframe cache outward from the playhead, so a drag across GOPs shows
         // every keyframe it crosses without decoding. Stop at 60% of the budget to leave room.
         guard cache.bytes < cache.budget * 6 / 10 else { return nil }
+        guard t >= 0 else { return nil }
         let tp = index.samples[t].pts
         return keyframes.filter { cache.peek($0) == nil }
             .min { abs(index.samples[$0].pts - tp) < abs(index.samples[$1].pts - tp) }
@@ -458,6 +463,10 @@ final class ScrubEngine {
         while true {
             let (t, g, alive) = current()
             if !alive { return }
+            if t < 0 {                                   // nothing asked for yet: don't decode on spec
+                if wake.wait(timeout: .now() + 1.5) == .timedOut { releaseLanes() }
+                continue
+            }
             outLock.lock()
             let done = shown == t
             let cached = done ? nil : cache.get(t)
