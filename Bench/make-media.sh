@@ -30,6 +30,10 @@ f=${STAMP//RATE/30000\/1001}; f=${f//BAR/${BAR//RATE/30000\/1001}}
 # C: synthetic 4K60 HEVC 10-bit in Matroska, 2 s GOP, with stereo audio
 f=${STAMP//RATE/60}; f=${f//BAR/${BAR//RATE/60}}
 # C kept short (format test only)
+# Matroska copies of the long files (same video, plus a mono 48 kHz AAC tone so the MKV audio path is exercised)
+for v in A-hevc-4k30-gop300-long B-h264-4k30-gop250-long; do
+  [[ -f $v.mkv ]] || ffmpeg -y -v error -i $v.mp4 -f lavfi -i "sine=f=440:r=48000" -map 0:v -map 1:a -c:v copy -c:a aac -ac 1 -shortest $v.mkv
+done
 [[ -f C-hevc10-4k60.mkv ]] || ffmpeg -y -v error -f lavfi -i "testsrc2=s=3840x2160:r=60:d=120" -f lavfi -i "sine=f=440:d=120" \
   -filter_complex "${f/format=yuv420p/noise=alls=12:allf=t,format=p010le}" -map '[o]' -map 1:a \
   -c:v hevc_videotoolbox -profile:v main10 -b:v 50M -g 120 -c:a aac C-hevc10-4k60.mkv
