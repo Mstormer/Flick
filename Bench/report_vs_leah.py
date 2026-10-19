@@ -39,7 +39,7 @@ METRICS = [  # scenario, key, label, unit, higher is better[, absolute differenc
     ("drag", "drop_pct", "Drag the seek bar: dropped refreshes (of 120 Hz)", "%", False),
     ("drag", "first_response_ms", "Drag the seek bar: first new picture", "ms", False),
     ("drag", "max_freeze_ms", "Drag the seek bar: longest freeze while moving", "ms", False),
-    ("drag", "settle_ms", "Drag the seek bar: release to final picture", "ms", False),
+    ("drag", "settle_ms", "Drag the seek bar: release to exact frame (median of 4 releases)", "ms", False),
     ("click", "first_picture_ms", "Click the seek bar: first new picture", "ms", False),
     ("click", "final_picture_ms", "Click the seek bar: exact frame on screen", "ms", False),
 ]
@@ -84,7 +84,7 @@ for v, kind, desc in VIDEOS:
         if key == "settle_ms":
             fd, ld = get(v, sc, "Flick", "final_depth"), get(v, sc, "Leah", "final_depth")
             if fd is not None and ld is not None:
-                extra = f" · released {fd:.0f} (Flick) and {ld:.0f} (Leah) frames past a keyframe"
+                extra = f" · releases averaged {fd:.0f} (Flick) and {ld:.0f} (Leah) frames past a keyframe"
         rows.append(f'''<tr><th scope="row">{html.escape(label)}<small>{"higher is better" if hib else "lower is better"}{extra}</small></th>
 <td><div class="pair"><span class="who">Flick</span>{bar(f, "flick")}<span class="num">{fmt(f, unit)}</span></div>
 <div class="pair"><span class="who">Leah</span>{bar(l, "leah")}<span class="num">{fmt(l, unit)}</span></div></td>
@@ -111,8 +111,8 @@ for v, kind, desc in VIDEOS:
         if key == "settle_ms":
             fd, ld = get(v, sc, "Flick", "final_depth"), get(v, sc, "Leah", "final_depth")
             if fd is not None and ld is not None and fd > ld * 1.5:
-                note = (f" The same 30% bar position landed on different frames: Flick's was {fd:.0f} frames past a keyframe,"
-                        f" Leah's {ld:.0f}, so Flick had {fd / max(ld, 1):.0f}× as much to decode.")
+                note = (f" The same bar positions landed on different frames: Flick's averaged {fd:.0f} frames past a keyframe,"
+                        f" Leah's {ld:.0f}, so Flick had {fd / max(ld, 1):.1f}× as much to decode.")
         ahead.append(f"<li>{html.escape(label)} on {kind} {html.escape(desc.split(',')[0])}: Leah {fmt(l, unit)}, Flick {fmt(f, unit)}.{html.escape(note)}</li>")
 for (p, v, ph), (busy, settled) in mem.items():
     if p == "Leah" and ("Flick", v, ph) in mem and settled < mem[("Flick", v, ph)][1] * 0.95:
@@ -216,10 +216,10 @@ code {{ font-family: var(--mono); font-size: 13px; background: var(--rest); padd
   <div><h2>Method</h2><ul>
     <li>{nruns} runs; each test repeated 3 times with the two players interleaved; medians shown. A run is redone once if the barcode was unreadable most of the time or the player never responded.</li>
     <li>Play: Space to start, 0.8 s to settle, then 10 s measured. A skipped frame is a gap in the frame numbers that reached the screen. An uneven gap is a picture that stayed up more than 1.5× its frame time. CPU energy is the kernel's estimate (<code>ri_energy_nj</code>); it doesn't include GPU or display power.</li>
-    <li>Hold: the skip key held 4 s at 30 repeats per second. Drag: seek bar swept from 5% to 95% in 3 s, paused 0.5 s, swept back to 30% in 1.5 s. Click: the same 12 spots on the bar in every run, 1.6 s apart.</li>
+    <li>Hold: the skip key held 4 s at 30 repeats per second. Drag: seek bar swept from 5% to 95% in 3 s, paused 0.5 s, swept back to 30% in 1.5 s and released; then three 1-second drags released at 47%, 64% and 21%. Click: the same 12 spots on the bar in every run, 1.6 s apart.</li>
     <li>Each run opens a fresh, uniquely named copy of the file, so neither player can resume a remembered position.</li>
     <li>Hold: like a real keyboard, the key starts repeating about 0.27 s after it goes down. Until then the target doesn't move, so the longest freeze is measured from the first repeat. Measured from the first press instead, both players' figures include that wait.</li>
-    <li>Drag release time depends on how far past a keyframe the release frame is, since every player has to decode from that keyframe to show the exact frame. Each player maps the same 30% bar position to a slightly different frame, so the depth is shown next to each release time.</li>
+    <li>Drag release time depends on how far past a keyframe the release frame is, since every player has to decode from that keyframe to show the exact frame. Each run releases at the same four bar positions for both players, and the average depth is shown next to each release time.</li>
     <li>A dropped refresh is a 120 Hz screen refresh during the drag that showed no new picture.</li>
     <li>Leah 4.1 from the App Store; Flick built from this repository. Harness: <code>Bench/suite.sh</code>.</li>
     {"".join(f"<li>{html.escape(l.strip())}</li>" for l in open(os.path.join(R, "notes.txt")) if l.strip()) if os.path.exists(os.path.join(R, "notes.txt")) else ""}

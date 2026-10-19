@@ -370,6 +370,19 @@ Task.detached {
             mouse(.leftMouseDragged, CGPoint(x: back, y: y))
             mouse(.leftMouseUp, CGPoint(x: back, y: y))
             sleep(2.0)
+            // three more short drags released at fixed spots, the same for every player: how long a release
+            // takes depends on how far past a keyframe it lands, so one release point is mostly luck
+            var from = back
+            for f in [0.47, 0.64, 0.21] {
+                let to = ax + (bx - ax) * f
+                mouse(.leftMouseDown, CGPoint(x: from, y: y))
+                t0 = now()
+                while true { let k = (now() - t0) / 1.0; if k >= 1 { break }; mouse(.leftMouseDragged, CGPoint(x: from + (to - from) * k, y: y)); sleep(0.008) }
+                mouse(.leftMouseDragged, CGPoint(x: to, y: y))
+                mouse(.leftMouseUp, CGPoint(x: to, y: y))
+                sleep(2.0)
+                from = to
+            }
         } else {
             // the same 12 spots on the bar for every run and every player, so medians compare like with like
             // (time to an exact frame depends on how far past a keyframe the click lands)

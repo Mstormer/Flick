@@ -189,8 +189,16 @@ final class PlayerView: NSView {
             var playAsset: AVURLAsset?
             if (try? await asset.load(.isPlayable)) == true {
                 playAsset = asset
-                backend = AVPlayerPlayback(asset: asset)
-                duration = (try? await asset.load(.duration).seconds) ?? 0
+                if let (native, idx) = await NativePlayback.make(asset: asset) {
+                    // decodes only a few frames ahead: about 100 MB less than AVPlayer for 4K
+                    native.onEnd = { [weak self] in self?.controls.setTime(self?.duration ?? 0, playing: false) }
+                    backend = native
+                    newIndex = idx
+                    duration = idx.duration
+                } else {
+                    backend = AVPlayerPlayback(asset: asset)
+                    duration = (try? await asset.load(.duration).seconds) ?? 0
+                }
                 size = (try? await asset.loadTracks(withMediaType: .video).first?.load(.naturalSize)) ?? .zero
             } else if let (mkv, idx) = await Task.detached(operation: { () -> (MKVFile, MediaIndex)? in
                           // Matroska natively: parse, index, and play without touching ffmpeg
@@ -445,6 +453,7 @@ final class PlayerView: NSView {
 
     private func endDrag() {
         dragging = false
+        engine?.settle()
         settle()
         scheduleHide()
     }

@@ -46,7 +46,7 @@ Task {
     }
     print(String(format: "index: %d samples, %.1f ms, sync=%d droppable=%d dur=%.1fs", idx.samples.count,
                  (CFAbsoluteTimeGetCurrent() - t0) * 1000, idx.samples.filter(\.sync).count,
-                 idx.samples.filter(\.droppable).count, idx.duration))
+                 idx.samples.indices.filter(idx.isDroppable).count, idx.duration))
     let eng = ScrubEngine(index: idx)!
     let done = DispatchSemaphore(value: 0)
     var gotPx: CVPixelBuffer?

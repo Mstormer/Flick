@@ -77,23 +77,28 @@ def summarise(run):
                  advanced_s=((final - start) / 29.97) if final is not None and start is not None else None,
                  final_is_keyframe=final in kf)
     elif sc == "drag":
-        t0 = ev("down")[0]; t1 = ev("up")[0]; tend = ev("end")[0]
-        ch = changes(fr, t0, t1)
-        after = changes(fr, t1, tend)
+        downs, ups, tend = ev("down"), ev("up"), ev("end")[0]
         rest = ev("dragRest")[0]
-        # pointer is moving during [down, rest] and [rest + 0.5 s, up]; the 0.5 s pause is not a freeze
-        segs = [(t0, rest), (rest + 0.5, t1)]
+        # the first drag pauses 0.5 s at the far end (not a freeze); later drags are one sweep each
+        segs = [(downs[0], rest), (rest + 0.5, ups[0])] + list(zip(downs[1:], ups[1:]))
         moving_time = sum(b - a for a, b in segs)
-        ch_moving = [c for c in ch if any(a <= c[0] <= b for a, b in segs)]
-        r.update(updates_per_s=len(ch_moving) / moving_time, distinct=len({f for _, f in ch}),
-                 first_response_ms=((ch[0][0] - t0) * 1000) if ch else None,
-                 max_freeze_ms=max(gaps([t for t, _ in ch if a <= t <= b], a, b) for a, b in segs) * 1000,
-                 settle_ms=((after[-1][0] - t1) * 1000) if after else 0.0,
-                 keyframe_share=(sum(f in kf for _, f in ch) / len(ch)) if ch else None,
-                 final_is_keyframe=last_valid_before(fr, tend) in kf,
-                 # frames between the previous keyframe and where the drag was released: the decoding any
-                 # player must do to show that exact frame, so release times are only comparable at similar depth
-                 final_depth=depth(kf, last_valid_before(fr, tend)))
+        ch_all = changes(fr, downs[0], tend)
+        ch_moving = [c for c in ch_all if any(a <= c[0] <= b for a, b in segs)]
+        settles, finals = [], []
+        for k, u in enumerate(ups):
+            nxt = downs[k + 1] if k + 1 < len(downs) else tend
+            after = changes(fr, u, nxt)
+            settles.append(((after[-1][0] - u) * 1000) if after else 0.0)
+            finals.append(last_valid_before(fr, nxt))
+        r.update(updates_per_s=len(ch_moving) / moving_time, distinct=len({f for _, f in ch_all}),
+                 first_response_ms=((ch_all[0][0] - downs[0]) * 1000) if ch_all else None,
+                 max_freeze_ms=max(gaps([t for t, _ in ch_all if a <= t <= b], a, b) for a, b in segs) * 1000,
+                 settle_ms=statistics.median(settles), settle_first_ms=settles[0], releases=len(ups),
+                 keyframe_share=(sum(f in kf for _, f in ch_all) / len(ch_all)) if ch_all else None,
+                 final_is_keyframe=finals[0] in kf,
+                 # frames between the previous keyframe and each release point: the decoding any player must
+                 # do to show that exact frame, so release times only compare at similar depth
+                 final_depth=statistics.mean(d for d in (depth(kf, f) for f in finals) if d is not None) if any(f is not None for f in finals) else None)
     elif sc.startswith("play"):
         pb = run.get("playback", {})
         rate = pb.get("rate", 1)

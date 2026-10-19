@@ -25,6 +25,9 @@ final class MediaIndex {
     let frameDuration: Double
     private let base: UnsafeMutableRawPointer
     private let mappedLength: Int
+    private let codec: CMVideoCodecType
+    private let nalLen: Int
+    private let dropState: UnsafeMutablePointer<UInt8>   // 0 not read yet, 1 droppable, 2 referenced
 
     convenience init?(asset: AVURLAsset) async {
         guard let track = try? await asset.loadTracks(withMediaType: .video).first,
@@ -38,8 +41,12 @@ final class MediaIndex {
         var out: [Sample] = []
         out.reserveCapacity(1 << 16)
         func conv(_ t: CMTime) -> Int64 { t.convertScale(ts, method: .roundHalfAwayFromZero).value }
+        let ownPath = url.standardizedFileURL.path
+        var lastURL: URL?
         repeat {
-            guard cursor.currentChunkStorageURL?.standardizedFileURL.path == url.standardizedFileURL.path else { return nil }   // external data refs: not supported
+            // external data refs: not supported (normalising a path per sample cost ~0.4 s on long files)
+            let u = cursor.currentChunkStorageURL
+            if u != lastURL { guard u?.standardizedFileURL.path == ownPath else { return nil }; lastURL = u }
             let r = cursor.currentSampleStorageRange
             let si = cursor.currentSampleSyncInfo
             out.append(Sample(pts: conv(cursor.presentationTimeStamp),
@@ -94,7 +101,8 @@ final class MediaIndex {
         fstat(fd, &st)
         guard let p = mmap(nil, Int(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0), p != MAP_FAILED else { return nil }
 
-        // Container rarely flags non-reference frames; read the first slice NAL header of each sample instead.
+        // Container rarely flags non-reference frames; the first slice NAL header says. It's read lazily
+        // (isDroppable): scanning every sample up front reads pages across the whole file, 0.5-2 s for 4K.
         let codec = CMFormatDescriptionGetMediaSubType(fmt)
         var nalLen: Int32 = 4
         if codec == kCMVideoCodecType_H264 {
@@ -104,26 +112,10 @@ final class MediaIndex {
             CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt, parameterSetIndex: 0, parameterSetPointerOut: nil,
                                                                parameterSetSizeOut: nil, parameterSetCountOut: nil, nalUnitHeaderLengthOut: &nalLen)
         }
-        if codec == kCMVideoCodecType_H264 || codec == kCMVideoCodecType_HEVC {
-            let bytes = p.assumingMemoryBound(to: UInt8.self)
-            for i in out.indices where !out[i].sync && !out[i].droppable {
-                var o = Int(out[i].offset)
-                let end = o + Int(out[i].size)
-                while o + Int(nalLen) + 2 <= end && o + Int(nalLen) + 2 <= Int(st.st_size) {
-                    var n = 0
-                    for k in 0..<Int(nalLen) { n = n << 8 | Int(bytes[o + k]) }
-                    let h = bytes[o + Int(nalLen)]
-                    if codec == kCMVideoCodecType_H264 {
-                        let type = h & 0x1f
-                        if type == 1 || type == 5 { out[i].droppable = (h & 0x60) == 0; break }
-                    } else {
-                        let type = (h >> 1) & 0x3f
-                        if type < 32 { out[i].droppable = type <= 14 && type % 2 == 0; break }
-                    }
-                    o += Int(nalLen) + n
-                }
-            }
-        }
+        self.codec = codec
+        self.nalLen = Int(nalLen)
+        dropState = .allocate(capacity: out.count)
+        dropState.initialize(repeating: 0, count: out.count)
 
         samples = out
         byPTS = out.indices.sorted { out[$0].pts < out[$1].pts }.map(Int32.init)
@@ -138,7 +130,41 @@ final class MediaIndex {
         frameDuration = Double(out.map(\.dur).max() ?? 1) / Double(ts)
     }
 
-    deinit { munmap(base, mappedLength) }
+    deinit { munmap(base, mappedLength); dropState.deallocate() }
+
+    /// Nothing references this frame: skip it unless it's the one to show. Byte-sized entries, so the
+    /// chase thread and the playback queue can both fill them in.
+    func isDroppable(_ i: Int) -> Bool {
+        let s = samples[i]
+        if s.sync { return false }
+        if s.droppable { return true }
+        switch dropState[i] {
+        case 1: return true
+        case 2: return false
+        default: break
+        }
+        var drop = false
+        if codec == kCMVideoCodecType_H264 || codec == kCMVideoCodecType_HEVC {
+            let bytes = base.assumingMemoryBound(to: UInt8.self)
+            var o = Int(s.offset)
+            let end = min(o + Int(s.size), mappedLength)
+            while o + nalLen + 2 <= end {
+                var n = 0
+                for k in 0..<nalLen { n = n << 8 | Int(bytes[o + k]) }
+                let h = bytes[o + nalLen]
+                if codec == kCMVideoCodecType_H264 {
+                    let type = h & 0x1f
+                    if type == 1 || type == 5 { drop = (h & 0x60) == 0; break }
+                } else {
+                    let type = (h >> 1) & 0x3f
+                    if type < 32 { drop = type <= 14 && type % 2 == 0; break }
+                }
+                o += nalLen + n
+            }
+        }
+        dropState[i] = drop ? 1 : 2
+        return drop
+    }
 
     var startPTS: Int64 { samples[Int(byPTS[0])].pts }
 
@@ -268,12 +294,21 @@ final class ScrubEngine {
     private var tick = 0
     private var direction = 0              // +1 dragging forward, -1 backward (guarded by lock)
     private var lastSeekAt = 0.0           // when the target last moved (guarded by lock)
+    private var prevSeekAt = 0.0           // the move before that (guarded by lock)
 
     /// The pointer is still moving: worth showing in-between pictures and pre-decoding the next GOP.
-    /// Once it stops, every decode goes to reaching the exact frame.
+    /// Once it stops, every decode goes to reaching the exact frame. A lone seek (a click, a single skip)
+    /// isn't motion: it goes straight to full batches, ~20 ms sooner to a deep frame.
     private var moving: Bool {
         lock.lock(); defer { lock.unlock() }
-        return CACurrentMediaTime() - lastSeekAt < 0.06
+        let now = CACurrentMediaTime()
+        return now - lastSeekAt < 0.06 && lastSeekAt - prevSeekAt < 0.06
+    }
+
+    /// The pointer was released: stop treating the last seeks as motion.
+    func settle() {
+        lock.lock(); lastSeekAt = 0; prevSeekAt = 0; lock.unlock()
+        wake.signal()
     }
     private var failedGen = -1
     private var retries = 0
@@ -352,6 +387,7 @@ final class ScrubEngine {
         Trace.log("seek \(d)")
         lock.lock()
         if d != target { direction = d > target ? 1 : -1 }
+        prevSeekAt = lastSeekAt
         lastSeekAt = CACurrentMediaTime()
         target = d; gen &+= 1
         lock.unlock()
@@ -500,7 +536,7 @@ final class ScrubEngine {
             // the user moved: drop speculation at once, but remember what this lane has already been fed;
             // feeding those frames again corrupts the decoder's references (HEVC reports bad data, -12909)
             if prefetching && current().0 != shownFrame() { lane.next = i; return }
-            if index.samples[i].droppable && i != t { i += 1; continue }   // nothing references it and it isn't the goal
+            if i != t && index.isDroppable(i) { i += 1; continue }   // nothing references it and it isn't the goal
             feed(lane, i)
             fed += 1
             i += 1

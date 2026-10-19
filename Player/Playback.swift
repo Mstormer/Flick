@@ -1,4 +1,5 @@
 import AVFoundation
+import VideoToolbox
 
 /// What the player view needs from a playback backend. MP4/MOV use AVPlayer; Matroska uses the native
 /// pipeline below. Either way the scrub engine handles seeking while the user interacts.
@@ -106,8 +107,116 @@ final class AVPlayerPlayback: Playback {
 /// Compressed video and audio straight from the MKV packet table into Apple's sample-buffer renderers,
 /// both slaved to one render synchronizer. Speed changes are a synchronizer rate change; the audio
 /// renderer time-stretches with pitch correction.
-final class NativePlayback: Playback {
+/// Audio for NativePlayback, from wherever the file keeps it. Used on the player's feed queue only.
+protocol AudioSource: AnyObject {
+    var format: CMAudioFormatDescription { get }
+    /// Start over from just before `seconds` (on the video's timeline).
+    func reset(at seconds: Double)
+    /// The next buffer to play, or nil at the end.
+    func next() -> CMSampleBuffer?
+}
+
+/// Matroska audio packets straight from the mapped file.
+final class MKVAudio: AudioSource {
+    let format: CMAudioFormatDescription
     private let mkv: MKVFile
+    private let packets: [MKVFile.Packet]
+    private let isPCM: Bool
+    private let tscale: Double                     // seconds per MKV timestamp unit
+    private var nextIndex = 0
+
+    init?(_ mkv: MKVFile) {
+        let tracks = mkv.audioTracks
+        guard let chosen = tracks.first(where: { $0.isDefault && MKVCodecs.audioFormat($0) != nil }) ?? tracks.first(where: { MKVCodecs.audioFormat($0) != nil }),
+              let f = MKVCodecs.audioFormat(chosen) else { return nil }
+        self.mkv = mkv
+        format = f.0
+        isPCM = f.isPCM
+        packets = mkv.packets[chosen.number] ?? []
+        tscale = Double(mkv.timecodeScale) / 1e9
+    }
+
+    func reset(at seconds: Double) {
+        nextIndex = packets.firstIndex { Double($0.pts) * tscale >= seconds } ?? packets.count
+    }
+
+    func next() -> CMSampleBuffer? {
+        while nextIndex < packets.count {
+            let p = packets[nextIndex]
+            nextIndex += 1
+            if let sb = buffer(p) { return sb }
+        }
+        return nil
+    }
+
+    private func buffer(_ p: MKVFile.Packet) -> CMSampleBuffer? {
+        var block: CMBlockBuffer?
+        guard CMBlockBufferCreateWithMemoryBlock(allocator: nil, memoryBlock: UnsafeMutableRawPointer(mutating: mkv.base + Int(p.offset)),
+                                                 blockLength: Int(p.size), blockAllocator: kCFAllocatorNull, customBlockSource: nil,
+                                                 offsetToData: 0, dataLength: Int(p.size), flags: 0, blockBufferOut: &block) == noErr,
+              let block else { return nil }
+        let t = CMTime(seconds: Double(p.pts) * tscale, preferredTimescale: 48000)
+        var sb: CMSampleBuffer?
+        if isPCM {
+            guard let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee, asbd.mBytesPerFrame > 0 else { return nil }
+            let frames = Int(p.size) / Int(asbd.mBytesPerFrame)
+            CMAudioSampleBufferCreateReadyWithPacketDescriptions(allocator: nil, dataBuffer: block, formatDescription: format,
+                                                                 sampleCount: frames, presentationTimeStamp: t,
+                                                                 packetDescriptions: nil, sampleBufferOut: &sb)
+        } else {
+            var pd = AudioStreamPacketDescription(mStartOffset: 0, mVariableFramesInPacket: 0, mDataByteSize: UInt32(p.size))
+            CMAudioSampleBufferCreateReadyWithPacketDescriptions(allocator: nil, dataBuffer: block, formatDescription: format,
+                                                                 sampleCount: 1, presentationTimeStamp: t,
+                                                                 packetDescriptions: &pd, sampleBufferOut: &sb)
+        }
+        return sb
+    }
+}
+
+/// MP4/MOV audio, still compressed, through AVAssetReader (a new reader per seek).
+final class AssetAudio: AudioSource {
+    let format: CMAudioFormatDescription
+    private let asset: AVURLAsset
+    private let track: AVAssetTrack
+    private let shift: CMTime                      // movie time → the video's media timeline (edit lists)
+    private var reader: AVAssetReader?
+    private var output: AVAssetReaderTrackOutput?
+
+    init(asset: AVURLAsset, track: AVAssetTrack, format: CMAudioFormatDescription, shift: CMTime) {
+        self.asset = asset
+        self.track = track
+        self.format = format
+        self.shift = shift
+    }
+
+    func reset(at seconds: Double) {
+        reader?.cancelReading()
+        reader = nil; output = nil
+        guard let r = try? AVAssetReader(asset: asset) else { return }
+        let o = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        o.alwaysCopiesSampleData = false
+        guard r.canAdd(o) else { return }
+        r.add(o)
+        let start = CMTimeSubtract(CMTime(seconds: max(0, seconds), preferredTimescale: 90000), shift)
+        r.timeRange = CMTimeRange(start: CMTimeMaximum(.zero, start), end: .positiveInfinity)
+        guard r.startReading() else { return }
+        reader = r; output = o
+    }
+
+    func next() -> CMSampleBuffer? {
+        guard let sb = output?.copyNextSampleBuffer() else { return nil }
+        guard shift != .zero else { return sb }
+        var info = [CMSampleTimingInfo](repeating: CMSampleTimingInfo(), count: max(1, CMSampleBufferGetNumSamples(sb)))
+        var n = 0
+        guard CMSampleBufferGetSampleTimingInfoArray(sb, entryCount: info.count, arrayToFill: &info, entriesNeededOut: &n) == noErr else { return sb }
+        for i in 0..<n { info[i].presentationTimeStamp = CMTimeAdd(info[i].presentationTimeStamp, shift); info[i].decodeTimeStamp = .invalid }
+        var out: CMSampleBuffer?
+        CMSampleBufferCreateCopyWithNewTiming(allocator: nil, sampleBuffer: sb, sampleTimingEntryCount: n, sampleTimingArray: &info, sampleBufferOut: &out)
+        return out ?? sb
+    }
+}
+
+final class NativePlayback: Playback {
     private let index: MediaIndex
     private var display = AVSampleBufferDisplayLayer()
     private(set) var isSuspended = false
@@ -115,13 +224,8 @@ final class NativePlayback: Playback {
     private let audio = AVSampleBufferAudioRenderer()
     private let sync = AVSampleBufferRenderSynchronizer()
     private let q = DispatchQueue(label: "flick.native.feed", qos: .userInitiated)
-    private let audioTrack: MKVFile.Track?
-    private let audioFormat: CMAudioFormatDescription?
-    private let audioIsPCM: Bool
-    private let audioPackets: [MKVFile.Packet]
-    private let tscale: Double                     // seconds per MKV timestamp unit
+    private let audioSource: AudioSource?
     private var vNext = 0                          // decode index of next video sample to enqueue
-    private var aNext = 0
     private var hideBefore: Int64 = .min           // video pts below this are decoded but not shown (exact seek)
     private var gen = 0
     private var flushedGen = -1                    // generation whose renderer flush has completed
@@ -130,27 +234,63 @@ final class NativePlayback: Playback {
     private var rate: Float = 1
     let duration: Double
     var onEnd: (() -> Void)?
+    // Video is decoded here rather than inside the display layer, so only a few frames are ever queued
+    // (the layer decodes up to a second ahead: ~280 MB of 4K pictures). Everything below is on q.
+    private var session: VTDecompressionSession?
+    private var outFormat: CMVideoFormatDescription?
+    private var inflight = 0                       // handed to the decoder, not out yet (this generation)
+    private var queued: [Int64] = []               // pts of pictures the layer holds that aren't on screen yet
+    private var pumpPending = false
+    private var audioTraced = -1
+    private var sessionBroken = false
+    private let fps: Double
 
     var layer: CALayer { display }
 
-    init(mkv: MKVFile, index: MediaIndex) {
-        self.mkv = mkv
+    init(index: MediaIndex, audio source: AudioSource?) {
         self.index = index
-        tscale = Double(mkv.timecodeScale) / 1e9
         duration = index.duration
-        let tracks = mkv.audioTracks
-        let chosen = tracks.first { $0.isDefault && MKVCodecs.audioFormat($0) != nil } ?? tracks.first { MKVCodecs.audioFormat($0) != nil }
-        audioTrack = chosen
-        let fmt = chosen.flatMap(MKVCodecs.audioFormat)
-        audioFormat = fmt?.0
-        audioIsPCM = fmt?.isPCM ?? false
-        audioPackets = chosen.flatMap { mkv.packets[$0.number] } ?? []
+        fps = 1 / max(index.frameDuration, 0.001)
+        audioSource = source
         display.videoGravity = .resizeAspect
         audio.audioTimePitchAlgorithm = .spectral
         sync.addRenderer(display.sampleBufferRenderer)
-        if audioFormat != nil { sync.addRenderer(audio) }
+        if audioSource != nil { sync.addRenderer(audio) }
         sync.delaysRateChangeUntilHasSufficientMediaData = false
         start(at: 0)
+    }
+
+    convenience init(mkv: MKVFile, index: MediaIndex) {
+        self.init(index: index, audio: MKVAudio(mkv))
+    }
+
+    /// A plain MP4/MOV (one video track, at most one audio track, no embedded subtitles, no rotation, SDR)
+    /// plays here too; anything fancier stays with AVPlayer. `defaults write app.flick.player avplayer -bool YES`
+    /// sends everything to AVPlayer.
+    static func make(asset: AVURLAsset) async -> (NativePlayback, MediaIndex)? {
+        guard !UserDefaults.standard.bool(forKey: "avplayer"),
+              let videos = try? await asset.loadTracks(withMediaType: .video), videos.count == 1, let v = videos.first,
+              let audios = try? await asset.loadTracks(withMediaType: .audio), audios.count <= 1,
+              (try? await asset.loadMediaSelectionGroup(for: .legible))?.options.isEmpty ?? true,
+              let transform = try? await v.load(.preferredTransform), transform.isIdentity,
+              let vfmt = try? await v.load(.formatDescriptions).first
+        else { return nil }
+        let tf = CMFormatDescriptionGetExtension(vfmt, extensionKey: kCMFormatDescriptionExtension_TransferFunction) as? String
+        if tf == (kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String) || tf == (kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String) { return nil }
+        var source: AudioSource?
+        if let a = audios.first {
+            guard let afmt = try? await a.load(.formatDescriptions).first else { return nil }
+            let ok: [AudioFormatID] = [kAudioFormatMPEG4AAC, kAudioFormatMPEG4AAC_HE, kAudioFormatMPEG4AAC_HE_V2, kAudioFormatAppleLossless,
+                                       kAudioFormatAC3, kAudioFormatEnhancedAC3, kAudioFormatMPEGLayer3, kAudioFormatOpus,
+                                       kAudioFormatFLAC, kAudioFormatLinearPCM]
+            guard ok.contains(CMFormatDescriptionGetMediaSubType(afmt)) else { return nil }
+            // audio comes out on the movie timeline; the video index is on the track's own timeline
+            let seg = (try? await v.load(.segments))?.first { !$0.isEmpty }
+            let shift = seg.map { CMTimeSubtract($0.timeMapping.source.start, $0.timeMapping.target.start) } ?? .zero
+            source = AssetAudio(asset: asset, track: a, format: afmt, shift: shift)
+        }
+        guard let idx = await MediaIndex(asset: asset), ScrubEngine.canDecode(idx) else { return nil }
+        return (NativePlayback(index: idx, audio: source), idx)
     }
 
     /// Whether this file has audio the system can't decode (the caller may prefer the remuxer then).
@@ -170,6 +310,7 @@ final class NativePlayback: Playback {
         audio.stopRequestingMediaData()
         display.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
         audio.flush()
+        q.sync { dropSession() }
         sync.removeRenderer(display.sampleBufferRenderer, at: sync.currentTime(), completionHandler: nil)
         // a display layer keeps its decoder (and its frame pool) until the layer itself goes away
         host = display.superlayer
@@ -202,6 +343,7 @@ final class NativePlayback: Playback {
         isPlaying = true
         sync.setRate(r, time: sync.currentTime())
         startEndWatch()
+        q.async { [self] in pump(gen) }
     }
 
     func pause() {
@@ -213,6 +355,7 @@ final class NativePlayback: Playback {
     func setRate(_ r: Float) {
         rate = r
         if isPlaying { sync.rate = r }
+        q.async { [self] in pump(gen) }
     }
 
     func cancelSeeks() { q.async { self.gen &+= 1 } }
@@ -230,7 +373,7 @@ final class NativePlayback: Playback {
 
     func teardown() {
         pause()
-        q.sync { gen &+= 1 }
+        q.sync { gen &+= 1; dropSession() }
         display.sampleBufferRenderer.stopRequestingMediaData()
         audio.stopRequestingMediaData()
     }
@@ -260,10 +403,13 @@ final class NativePlayback: Playback {
             sync.setRate(0, time: pts(targetPTS))
             vNext = start
             hideBefore = targetPTS
+            inflight = 0
+            queued = []
+            if sessionBroken { dropSession() }
             let at = Double(targetPTS) / Double(index.timescale) - 0.05
-            aNext = audioPackets.firstIndex { Double($0.pts) * tscale >= at } ?? audioPackets.count
-            display.sampleBufferRenderer.requestMediaDataWhenReady(on: q) { [weak self] in self?.feedVideo(g) }
-            if audioFormat != nil { audio.requestMediaDataWhenReady(on: q) { [weak self] in self?.feedAudio(g) } }
+            audioSource?.reset(at: at)
+            pump(g)
+            if audioSource != nil { audio.requestMediaDataWhenReady(on: q) { [weak self] in self?.feedAudio(g) } }
             if let completion { waitForPicture(g, deadline: CACurrentMediaTime() + 2, completion) }
         }
     }
@@ -282,51 +428,92 @@ final class NativePlayback: Playback {
         q.asyncAfter(deadline: .now() + 0.004) { [weak self] in self?.waitForPicture(g, deadline: deadline, completion) }
     }
 
-    private func feedVideo(_ g: Int) {
-        let r = display.sampleBufferRenderer
-        while g == gen && r.isReadyForMoreMediaData && vNext < index.samples.count {
-            let s = index.samples[vNext]
+    /// How many pictures to keep decoded ahead: ~0.12 s of video at the current speed, at least 4.
+    private var lead: Int { max(4, Int((0.12 * Double(max(rate, 1)) * fps).rounded(.up))) }
+
+    private func dropSession() {
+        if let s = session { VTDecompressionSessionInvalidate(s) }
+        session = nil
+        sessionBroken = false
+    }
+
+    private func makeSession() -> VTDecompressionSession? {
+        let spec = [kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: true] as CFDictionary
+        let attrs = [kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+                     kCVPixelBufferMetalCompatibilityKey: true] as CFDictionary
+        var s: VTDecompressionSession?
+        guard VTDecompressionSessionCreate(allocator: nil, formatDescription: index.format, decoderSpecification: spec,
+                                           imageBufferAttributes: attrs, outputCallback: nil,
+                                           decompressionSessionOut: &s) == noErr, let s else { return nil }
+        VTSessionSetProperty(s, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        return s
+    }
+
+    /// Keep `lead` pictures decoded ahead of the clock. Frames before an exact-seek target are decoded for
+    /// their references only (and skipped entirely when nothing references them).
+    private func pump(_ g: Int) {
+        pumpPending = false
+        guard g == gen, !isSuspended else { return }
+        if session == nil { session = makeSession() }
+        guard let s = session else { return }
+        let now = Int64((sync.currentTime().seconds * Double(index.timescale)).rounded(.down))
+        queued.removeAll { $0 <= now }
+        while vNext < index.samples.count && queued.count + inflight < lead {
+            let d = vNext
+            let smp = index.samples[d]
             vNext += 1
-            guard let sb = index.sampleBuffer(vNext - 1) else { continue }
-            if s.pts < hideBefore, let a = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: true) as? [NSMutableDictionary] {
-                a.first?[kCMSampleAttachmentKey_DoNotDisplay] = true
+            if smp.pts < hideBefore && index.isDroppable(d) { continue }
+            guard let sb = index.sampleBuffer(d) else { continue }
+            inflight += 1
+            let st = VTDecompressionSessionDecodeFrame(s, sampleBuffer: sb, flags: [._EnableAsynchronousDecompression, ._EnableTemporalProcessing],
+                                                       infoFlagsOut: nil) { [weak self] status, _, image, t, _ in
+                self?.q.async { self?.decoded(g, status, image, t) }
             }
-            r.enqueue(sb)
+            if st != noErr { inflight -= 1; sessionBroken = true }
         }
-        if vNext >= index.samples.count { r.stopRequestingMediaData() }
+        if vNext >= index.samples.count { VTDecompressionSessionFinishDelayedFrames(s) }
+        // playing: come back once about half the queue has been shown
+        if sync.rate > 0 && !pumpPending && vNext < index.samples.count {
+            pumpPending = true
+            let wait = Double(max(1, lead / 2)) / fps / Double(sync.rate)
+            q.asyncAfter(deadline: .now() + wait) { [weak self] in self?.pump(g) }
+        }
+    }
+
+    private func decoded(_ g: Int, _ status: OSStatus, _ image: CVImageBuffer?, _ t: CMTime) {
+        guard g == gen else { return }
+        inflight = max(0, inflight - 1)
+        if status != noErr { sessionBroken = true }
+        let p = t.convertScale(index.timescale, method: .roundHalfAwayFromZero).value
+        if status == noErr, let image, p >= hideBefore {
+            if outFormat == nil || !CMVideoFormatDescriptionMatchesImageBuffer(outFormat!, imageBuffer: image) {
+                var f: CMVideoFormatDescription?
+                CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: image, formatDescriptionOut: &f)
+                outFormat = f
+            }
+            var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: CMTimeScale(max(1, fps.rounded()))),
+                                            presentationTimeStamp: t, decodeTimeStamp: .invalid)
+            var sb: CMSampleBuffer?
+            if let f = outFormat {
+                CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: image, formatDescription: f,
+                                                         sampleTiming: &timing, sampleBufferOut: &sb)
+            }
+            if let sb {
+                if sync.rate > 0, CMTimeCompare(t, sync.currentTime()) < 0 { Trace.log("late \(p)") }
+                display.sampleBufferRenderer.enqueue(sb)
+                queued.append(p)
+            }
+        }
+        if !pumpPending { pump(g) }
     }
 
     private func feedAudio(_ g: Int) {
-        guard let fmt = audioFormat else { return }
-        while g == gen && audio.isReadyForMoreMediaData && aNext < audioPackets.count {
-            let p = audioPackets[aNext]
-            aNext += 1
-            if let sb = audioBuffer(p, fmt) { audio.enqueue(sb) }
+        guard let src = audioSource else { return }
+        while g == gen && audio.isReadyForMoreMediaData {
+            guard let sb = src.next() else { audio.stopRequestingMediaData(); return }
+            if audioTraced != g { audioTraced = g; Trace.log(String(format: "audio first %.3f video target %.3f", CMSampleBufferGetPresentationTimeStamp(sb).seconds, Double(hideBefore) / Double(index.timescale))) }
+            audio.enqueue(sb)
         }
-        if aNext >= audioPackets.count { audio.stopRequestingMediaData() }
-    }
-
-    private func audioBuffer(_ p: MKVFile.Packet, _ fmt: CMAudioFormatDescription) -> CMSampleBuffer? {
-        var block: CMBlockBuffer?
-        guard CMBlockBufferCreateWithMemoryBlock(allocator: nil, memoryBlock: UnsafeMutableRawPointer(mutating: mkv.base + Int(p.offset)),
-                                                 blockLength: Int(p.size), blockAllocator: kCFAllocatorNull, customBlockSource: nil,
-                                                 offsetToData: 0, dataLength: Int(p.size), flags: 0, blockBufferOut: &block) == noErr,
-              let block else { return nil }
-        let t = CMTime(seconds: Double(p.pts) * tscale, preferredTimescale: 48000)
-        var sb: CMSampleBuffer?
-        if audioIsPCM {
-            guard let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt)?.pointee, asbd.mBytesPerFrame > 0 else { return nil }
-            let frames = Int(p.size) / Int(asbd.mBytesPerFrame)
-            CMAudioSampleBufferCreateReadyWithPacketDescriptions(allocator: nil, dataBuffer: block, formatDescription: fmt,
-                                                                 sampleCount: frames, presentationTimeStamp: t,
-                                                                 packetDescriptions: nil, sampleBufferOut: &sb)
-        } else {
-            var pd = AudioStreamPacketDescription(mStartOffset: 0, mVariableFramesInPacket: 0, mDataByteSize: UInt32(p.size))
-            CMAudioSampleBufferCreateReadyWithPacketDescriptions(allocator: nil, dataBuffer: block, formatDescription: fmt,
-                                                                 sampleCount: 1, presentationTimeStamp: t,
-                                                                 packetDescriptions: &pd, sampleBufferOut: &sb)
-        }
-        return sb
     }
 
     private func startEndWatch() {
@@ -334,9 +521,9 @@ final class NativePlayback: Playback {
         defer { endTimer?.tolerance = 0.1 }
         endTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             guard let self, self.isPlaying else { return }
-            Trace.log(String(format: "native t=%.2f audio=%d err=%@ video=%d aNext=%d vNext=%d", self.currentSeconds,
+            Trace.log(String(format: "native t=%.2f audio=%d err=%@ video=%d vNext=%d", self.currentSeconds,
                              self.audio.status.rawValue, String(describing: self.audio.error), self.display.sampleBufferRenderer.status.rawValue,
-                             self.aNext, self.vNext))
+                             self.vNext))
             if self.currentSeconds >= self.duration - 0.02 {
                 self.pause()
                 self.onEnd?()
