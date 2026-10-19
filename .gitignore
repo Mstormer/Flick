@@ -1,0 +1,23 @@
+.DS_Store
+Media/
+build/
+Results/
+*.bak
+# compiled harness tools (rebuilt from their .swift sources)
+Bench/allwin
+Bench/axcancel
+Bench/axdbg
+Bench/axdump
+Bench/bench
+Bench/dlgpos
+Bench/keytap
+Bench/shot
+Bench/winid
+Bench/captest/captest
+Bench/energy/energy
+Bench/enginetest/enginetest
+Bench/enginetest/enginetest-dbg
+Bench/memdiag/memdiag
+Bench/settingstest/settingstest
+Bench/uitest/uitest
+*.dSYM/
