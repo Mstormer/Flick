@@ -302,7 +302,8 @@ final class ScrubEngine {
     private var moving: Bool {
         lock.lock(); defer { lock.unlock() }
         let now = CACurrentMediaTime()
-        return now - lastSeekAt < 0.06 && lastSeekAt - prevSeekAt < 0.06
+        // a run of seeks (a drag, a held key: its first repeat comes ~0.27 s after the press) is motion
+        return now - lastSeekAt < 0.06 && lastSeekAt - prevSeekAt < 0.35
     }
 
     /// The pointer was released: stop treating the last seeks as motion.
