@@ -93,6 +93,8 @@ final class PlayerView: NSView {
     private let controls = ControlBar()
     private let hud = NSTextField(labelWithString: "")
     private let volumeBadge = VolumeBadge()
+    private let previewBubble = PreviewBubble()
+    private var thumbnailer: Thumbnailer?
     private let captionOverlay = CaptionOverlay()
     private var mkv: MKVFile?
     private(set) var captionSources: [CaptionSource] = []
@@ -141,8 +143,11 @@ final class PlayerView: NSView {
         controls.scrubber.onMove = { [weak self] f in self?.seek(fraction: f) }
         controls.scrubber.onEnd = { [weak self] in self?.endDrag() }
         controls.scrubber.onStep = { [weak self] by in self?.skip(by) }
+        controls.scrubber.onHover = { [weak self] f in self?.preview(at: f) }
         controls.onPlay = { [weak self] in self?.togglePlay() }
         controls.onRate = { [weak self] in self?.faster() }
+        controls.onMute = { [weak self] in self?.toggleMute(nil) }
+        controls.onVolume = { [weak self] v in self?.setVolume(v) }
 
         for t in [hud, status] {
             t.font = .monospacedDigitSystemFont(ofSize: 15, weight: .semibold)
@@ -155,6 +160,7 @@ final class PlayerView: NSView {
             addSubview(t)
         }
         addSubview(volumeBadge)
+        addSubview(previewBubble)
         addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseMoved, .activeAlways, .inVisibleRect, .mouseEnteredAndExited], owner: self))
     }
 
@@ -240,6 +246,8 @@ final class PlayerView: NSView {
                 }
             }
             controls.duration = duration
+            controls.setVolume(backend.volume, muted: backend.isMuted)
+            if size.width > 0, size.height > 0 { previewBubble.aspect = size.width / size.height }
             tick()
             controls.setRate(rate)
             backend.setRate(rate)
@@ -258,6 +266,7 @@ final class PlayerView: NSView {
                 eng.setIdle(!backend.isPlaying)
                 index = idx
                 engine = eng
+                thumbnailer = Thumbnailer(index: idx)
             }
         }
     }
@@ -500,6 +509,36 @@ final class PlayerView: NSView {
         b.volume = max(0, min(1, b.volume + by))
         if by != 0, b.isMuted { b.isMuted = false }
         volumeBadge.show(b.volume, muted: b.isMuted, in: bounds)
+        controls.setVolume(b.volume, muted: b.isMuted)
+    }
+
+    /// From the control-bar slider: the slider itself shows the level, so no badge.
+    private func setVolume(_ v: Float) {
+        guard let b = backend else { return }
+        b.volume = max(0, min(1, v))
+        if b.isMuted && v > 0 { b.isMuted = false }
+        controls.setVolume(b.volume, muted: b.isMuted)
+        scheduleHide()
+    }
+
+    // MARK: timeline preview
+
+    /// Hovering or dragging on the seek bar: the time there and the keyframe at or before it.
+    private func preview(at f: Double?) {
+        guard let f, duration > 0, controls.alphaValue > 0 || dragging else { previewBubble.show(false); return }
+        let t = f * duration
+        previewBubble.setTime(ControlBar.fmt(t))
+        let bar = convert(controls.scrubber.bounds, from: controls.scrubber)
+        let w = PreviewBubble.width, h = previewBubble.height
+        let cx = bar.minX + controls.scrubber.x(at: f)
+        previewBubble.frame = NSRect(x: max(8, min(bounds.width - w - 8, cx - w / 2)), y: bar.maxY + 6, width: w, height: h)
+        previewBubble.show(true)
+        guard let th = thumbnailer, let index else { return }
+        th.spacing = dragging ? 0.08 : 0          // leave the hardware decoder to the main picture while dragging
+        th.request(frame: index.frame(at: t)) { [weak self] img, k in
+            guard let self, self.previewBubble.alphaValue > 0 else { return }
+            self.previewBubble.setPicture(img, key: k)
+        }
     }
 
     @objc func faster() { setRate(Self.rates.first { $0 > rate + 0.001 } ?? Self.rates.last!) }
@@ -637,6 +676,7 @@ final class PlayerView: NSView {
         guard let b = backend else { return }
         b.isMuted.toggle()
         volumeBadge.show(b.volume, muted: b.isMuted, in: bounds)
+        controls.setVolume(b.volume, muted: b.isMuted)
     }
     @objc func setSpeedFromMenu(_ s: NSMenuItem) { setRate(Float(s.tag)) }
     @objc func performShortcutItem(_ s: NSMenuItem) {
@@ -714,7 +754,7 @@ final class PlayerView: NSView {
             case ",": stepFrame(-1)
             case ".": stepFrame(1)
             case "f": window?.toggleFullScreen(nil)
-            case "m": if let b = backend { b.isMuted.toggle(); flash(hud, b.isMuted ? "Muted" : "Sound") }
+            case "m": if let b = backend { b.isMuted.toggle(); flash(hud, b.isMuted ? "Muted" : "Sound"); controls.setVolume(b.volume, muted: b.isMuted) }
             case "]": faster()
             case "[": slower()
             case "\\", "\u{7f}": normalSpeed()
@@ -776,6 +816,7 @@ final class PlayerView: NSView {
         let w = DispatchWorkItem { [weak self] in
             guard let self, !self.dragging, !self.controls.isMouseInside, !self.overWindowButtons else { return }
             NSAnimationContext.runAnimationGroup { $0.duration = 0.25; self.controls.animator().alphaValue = 0 }
+            self.previewBubble.show(false)
             self.setWindowButtons(visible: false, duration: 0.25)
             if self.window?.isKeyWindow == true { NSCursor.setHiddenUntilMouseMoves(true) }
         }
@@ -808,10 +849,14 @@ final class ControlBar: NSView {
     private let timeLabel = NSTextField(labelWithString: "0:00")
     private let durLabel = NSTextField(labelWithString: "0:00")
     private let rateButton = NSButton()
+    private let muteButton = NSButton()
+    private let volume = NSSlider(value: 1, minValue: 0, maxValue: 1, target: nil, action: nil)
     private let gradient = CAGradientLayer()
     var onPlay: (() -> Void)?
     var onRate: (() -> Void)?
-    var duration: Double = 0 { didSet { durLabel.stringValue = Self.fmt(duration) } }
+    var onMute: (() -> Void)?
+    var onVolume: ((Float) -> Void)?
+    var duration: Double = 0 { didSet { durLabel.stringValue = Self.fmt(duration); needsLayout = true } }
     private(set) var time: Double = 0
     var isMouseInside: Bool {
         guard let w = window else { return false }
@@ -839,8 +884,20 @@ final class ControlBar: NSView {
             l.textColor = NSColor(white: 1, alpha: 0.9)
         }
         durLabel.alignment = .right
-        [play, timeLabel, scrubber, durLabel, rateButton].forEach(addSubview)
+        muteButton.isBordered = false
+        muteButton.contentTintColor = .white
+        muteButton.target = self; muteButton.action = #selector(tapMute)
+        muteButton.toolTip = "Mute (M)"
+        volume.controlSize = .small
+        volume.isContinuous = true
+        volume.appearance = NSAppearance(named: .darkAqua)
+        volume.trackFillColor = .white
+        volume.target = self; volume.action = #selector(slideVolume)
+        volume.setAccessibilityLabel("Volume")
+        volume.toolTip = "Volume (↑ ↓ or two-finger swipe)"
+        [play, muteButton, volume, timeLabel, scrubber, durLabel, rateButton].forEach(addSubview)
         setTime(0, playing: true)
+        setVolume(1, muted: false)
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -850,13 +907,34 @@ final class ControlBar: NSView {
         CATransaction.begin(); CATransaction.setDisableActions(true)
         gradient.frame = bounds
         CATransaction.commit()
-        let y: CGFloat = 14
-        play.frame = NSRect(x: 12, y: y, width: 28, height: 28)
-        timeLabel.frame = NSRect(x: 44, y: y + 6, width: 64, height: 16)
-        rateButton.frame = NSRect(x: bounds.width - 58, y: y + 2, width: 46, height: 24)
-        durLabel.frame = NSRect(x: bounds.width - 128, y: y + 6, width: 64, height: 16)
-        scrubber.frame = NSRect(x: 108, y: y, width: bounds.width - 244, height: 28)
+        // Every element sized to what it draws, 20 pt from the edges and 20 pt apart (HIG: consistent spacing).
+        let edge: CGFloat = 20, gap: CGFloat = 20, mid: CGFloat = 28
+        func place(_ v: NSView, _ x: CGFloat, _ w: CGFloat, _ h: CGFloat) { v.frame = NSRect(x: x, y: (mid - h / 2).rounded(), width: w, height: h) }
+        let playW = Self.playWidth
+        let muteW = Self.speakerWidth
+        let labelW = ceil(NSAttributedString(string: Self.fmt(max(duration, 600)).replacingOccurrences(of: #"\d"#, with: "0", options: .regularExpression),
+                                             attributes: [.font: timeLabel.font!]).size().width) + 4   // + the label's own 2 pt insets
+        let rateW = ceil(rateButton.attributedTitle.size().width)
+        var x = edge
+        place(play, x, playW, 28); x += playW + gap
+        place(timeLabel, x - 2, labelW, 16); x += labelW - 4 + gap
+        var r = bounds.width - edge
+        place(volume, r - 74, 76, 20); r -= 72 + gap          // the slider draws its knob 2 pt inside its frame
+        place(muteButton, r - muteW, muteW, 24); r -= muteW + gap
+        place(rateButton, r - rateW, rateW, 24); r -= rateW + gap
+        place(durLabel, r - labelW + 2, labelW, 16); r -= labelW - 4 + gap
+        // the bar's track is inset 6 pt inside its frame
+        place(scrubber, x - 6, max(40, r - x + 12), 28)
     }
+
+    static let playWidth: CGFloat = ["play.fill", "pause.fill"]
+        .compactMap { NSImage(systemSymbolName: $0, accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 16, weight: .semibold))?.size.width }
+        .max() ?? 16
+
+    /// Widest of the speaker glyphs, so the slider doesn't shift when the icon changes.
+    static let speakerWidth: CGFloat = ["speaker.slash.fill", "speaker.wave.1.fill", "speaker.wave.2.fill", "speaker.wave.3.fill"]
+        .compactMap { NSImage(systemSymbolName: $0, accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 14, weight: .semibold))?.size.width }
+        .max() ?? 20
 
     /// Hidden controls: remember the time without touching any view.
     func noteTime(_ t: Double) { time = t }
@@ -880,10 +958,25 @@ final class ControlBar: NSView {
         rateButton.attributedTitle = NSAttributedString(string: PlayerView.label(r), attributes: [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .bold),
             .foregroundColor: r == 1 ? NSColor(white: 1, alpha: 0.75) : NSColor.systemYellow])
+        needsLayout = true
     }
 
     @objc private func tapPlay() { onPlay?() }
     @objc private func tapRate() { onRate?() }
+    @objc private func tapMute() { onMute?() }
+    @objc private func slideVolume() { onVolume?(Float(volume.doubleValue)) }
+
+    /// Slider at the level, speaker glyph for the level (crossed out when muted).
+    func setVolume(_ v: Float, muted: Bool) {
+        if abs(volume.doubleValue - Double(v)) > 0.001 { volume.doubleValue = Double(v) }
+        let name = muted || v == 0 ? "speaker.slash.fill" : v < 0.34 ? "speaker.wave.1.fill" : v < 0.67 ? "speaker.wave.2.fill" : "speaker.wave.3.fill"
+        if muteButton.image?.accessibilityDescription != name {
+            muteButton.image = NSImage(systemSymbolName: name, accessibilityDescription: name)?
+                .withSymbolConfiguration(.init(pointSize: 14, weight: .semibold))
+        }
+        muteButton.setAccessibilityLabel(muted ? "Unmute" : "Mute")
+        muteButton.toolTip = muted ? "Unmute (M)" : "Mute (M)"
+    }
 
     static func fmt(_ s: Double) -> String {
         guard s.isFinite else { return "0:00" }
@@ -897,6 +990,8 @@ final class Scrubber: NSView {
     var onMove: ((Double) -> Void)?
     var onEnd: (() -> Void)?
     var onStep: ((Double) -> Void)?           // VoiceOver increment/decrement: seconds to skip
+    var onHover: ((Double?) -> Void)?         // pointer over the bar (or dragging): position 0...1, nil when gone
+    private var pressed = false
     var timeText = "0:00"                     // spoken value, e.g. "1:23 of 16:10"
     var progress: Double = 0 {
         didSet { if abs(progress - oldValue) * Double(bounds.width) >= 0.5 { needsDisplay = true } }   // redraw only on a visible move
@@ -927,11 +1022,18 @@ final class Scrubber: NSView {
         return rtl ? 1 - f : f
     }
 
-    override func mouseDown(with e: NSEvent) { onBegin?(); progress = fraction(e); onMove?(progress) }
-    override func mouseDragged(with e: NSEvent) { progress = fraction(e); onMove?(progress) }
-    override func mouseUp(with e: NSEvent) { onEnd?() }
-    override func mouseMoved(with e: NSEvent) { hover = convert(e.locationInWindow, from: nil).x; needsDisplay = true }
-    override func mouseExited(with e: NSEvent) { hover = nil; needsDisplay = true }
+    override func mouseDown(with e: NSEvent) { pressed = true; onBegin?(); progress = fraction(e); onMove?(progress); onHover?(progress) }
+    override func mouseDragged(with e: NSEvent) { progress = fraction(e); onMove?(progress); onHover?(progress) }
+    override func mouseUp(with e: NSEvent) {
+        pressed = false
+        onEnd?()
+        if !bounds.contains(convert(e.locationInWindow, from: nil)) { hover = nil; needsDisplay = true; onHover?(nil) }
+    }
+    override func mouseMoved(with e: NSEvent) { hover = convert(e.locationInWindow, from: nil).x; needsDisplay = true; onHover?(fraction(e)) }
+    override func mouseExited(with e: NSEvent) { guard !pressed else { return }; hover = nil; needsDisplay = true; onHover?(nil) }
+
+    /// Where position `f` sits along the bar, in this view's coordinates.
+    func x(at f: Double) -> CGFloat { 6 + (bounds.width - 12) * CGFloat(rtl ? 1 - f : f) }
 
     override func draw(_ r: NSRect) {
         let contrast = NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
