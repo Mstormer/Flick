@@ -10,6 +10,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var windows: [PlayerWindowController] = []
     private var openedAny = false
 
+    func applicationWillFinishLaunching(_ n: Notification) { Remuxer.clear() }   // before any file can open
+
     func applicationDidFinishLaunching(_ n: Notification) {
         buildMenu()
         let args = CommandLine.arguments.dropFirst().filter { !$0.hasPrefix("-") }
@@ -21,6 +23,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func application(_ app: NSApplication, open urls: [URL]) { urls.forEach(open) }
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
+    func applicationWillTerminate(_ n: Notification) { Remuxer.clear() }
 
     func open(_ url: URL) {
         openedAny = true
@@ -1055,10 +1058,22 @@ final class Scrubber: NSView {
 
 // MARK: - Formats AVFoundation won't open (MKV, WebM, AVI…): fast stream copy into MP4 via ffmpeg.
 
+/// The copies are as big as the originals, so they last only while Flick runs: cleared on quit, and at
+/// launch in case the last run crashed.
 enum Remuxer {
+    static let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("Flick")
+    private static let lock = NSLock()
+    private static var running: Set<Process> = []
+
+    /// Stops any copy in progress and removes every copy.
+    static func clear() {
+        let ps = lock.withLock { defer { running = [] }; return running }
+        for p in ps where p.isRunning { p.terminate(); p.waitUntilExit() }
+        try? FileManager.default.removeItem(at: dir)
+    }
+
     static func remux(_ url: URL) async -> URL? {
         guard let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"].first(where: FileManager.default.isExecutableFile) else { return nil }
-        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("Flick")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
         let key = "\(url.path)|\(attrs?[.size] ?? 0)|\((attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)"
@@ -1073,8 +1088,10 @@ enum Remuxer {
                 + tag + audio + ["-sn", "-f", "mp4", tmp.path]
             let code: Int32 = await withCheckedContinuation { c in
                 p.terminationHandler = { c.resume(returning: $0.terminationStatus) }
+                _ = lock.withLock { running.insert(p) }
                 do { try p.run() } catch { c.resume(returning: -1) }
             }
+            _ = lock.withLock { running.remove(p) }
             if code == 0, (try? await AVURLAsset(url: tmp).load(.isPlayable)) == true {
                 try? FileManager.default.moveItem(at: tmp, to: out)
                 return out
