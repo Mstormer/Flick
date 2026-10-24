@@ -14,7 +14,11 @@ for l in libavformat.63 libavcodec.63 libavutil.61; do
   strip -x $APP/Contents/Frameworks/$l.dylib
   codesign -s - --force $APP/Contents/Frameworks/$l.dylib
 done
-cp Player/Licenses.txt $APP/Contents/Resources/
+# the license notice carries the exact FFmpeg build configuration (with local paths made relative)
+CONF=$(sed -n 's/^#define FFMPEG_CONFIGURATION "\(.*\)"$/\1/p' Vendor/src/ffmpeg-*/config.h | sed "s#$PWD/##g")
+[[ -n $CONF ]] || { echo "no FFmpeg build configuration found" >&2; exit 1; }
+CONF="$CONF" awk '{ gsub("@FFMPEG_CONFIGURATION@", ENVIRON["CONF"]); print }' Player/Licenses.txt > $APP/Contents/Resources/Licenses.txt
+cp Player/Credits.html $APP/Contents/Resources/                 # shown in the About box
 [[ -f Player/AppIcon.icns ]] && cp Player/AppIcon.icns $APP/Contents/Resources/
 cat > $APP/Contents/Info.plist <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

@@ -7,14 +7,16 @@ set -e
 cd "${0:A:h}/.."
 VER=9.0.2
 SHA=8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
-OUT=$PWD/Vendor/ffmpeg
+VENDOR=$PWD/Vendor
+OUT=$VENDOR/ffmpeg
 mkdir -p Vendor/src
 cd Vendor/src
 [[ -f ffmpeg-$VER.tar.xz ]] || curl -sSfLO https://ffmpeg.org/releases/ffmpeg-$VER.tar.xz
 echo "$SHA  ffmpeg-$VER.tar.xz" | shasum -a 256 -c -
 [[ -d ffmpeg-$VER ]] || tar xf ffmpeg-$VER.tar.xz
 cd ffmpeg-$VER
-./configure --prefix="$OUT" --install-name-dir=@rpath \
+# a neutral prefix (the libraries embed their configure line), installed into Vendor/ffmpeg via DESTDIR
+./configure --prefix=/ffmpeg --install-name-dir=@rpath \
   --arch=arm64 --cc=clang --extra-cflags="-mmacosx-version-min=14.0" --extra-ldflags="-mmacosx-version-min=14.0" \
   --enable-shared --disable-static --disable-programs --disable-doc --disable-network --disable-autodetect \
   --disable-everything --disable-avdevice --disable-avfilter --disable-swscale --disable-swresample \
@@ -26,7 +28,7 @@ cd ffmpeg-$VER
   --enable-protocol=file \
   --enable-bsf=vp9_superframe_split
 make -j8 >/dev/null
-make install >/dev/null
+make install DESTDIR="$VENDOR" >/dev/null
 cd "$OUT/lib"
 # keep only the versioned dylibs the app links against
 ls -la *.dylib | grep -v "^l"
