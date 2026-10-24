@@ -308,6 +308,7 @@ final class NativePlayback: Playback {
     }
 
     var currentSeconds: Double { max(0, sync.currentTime().seconds - Double(index.startPTS) / Double(index.timescale)) }
+    var usesFFmpegAudio: Bool { audioSource is FFAudio }
     var volume: Float { get { audio.volume } set { audio.volume = newValue } }
     var isMuted: Bool { get { audio.isMuted } set { audio.isMuted = newValue } }
 

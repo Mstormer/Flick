@@ -6,6 +6,7 @@ import AppKit
 /// player window is key, so single-key shortcuts never fire while typing in Settings.
 enum MainMenu {
     static let shortcutsTag = 900          // items generated from the Settings shortcut table
+    static let previousVideoTag = 801, nextVideoTag = 802, volumeUpTag = 803, volumeDownTag = 804
     static func key(_ scalar: Int) -> String { String(Character(UnicodeScalar(scalar)!)) }
 
     static func build(_ app: AppDelegate) -> NSMenu {
@@ -44,6 +45,8 @@ enum MainMenu {
         item(view, "Enter Full Screen", #selector(NSWindow.toggleFullScreen(_:)), "f", [.control, .command])
         view.addItem(.separator())
         item(view, "Hide Controls", #selector(PlayerView.toggleControllerVisibility(_:)), "", [])
+        item(view, "Show Playlist", #selector(PlayerView.togglePlaylist(_:)), "l", [])
+        item(view, "Show Info", #selector(PlayerView.toggleInfo(_:)), "i", [])
         let subsItem = view.addItem(withTitle: "Subtitles", action: nil, keyEquivalent: "")
         let subs = NSMenu(title: "Subtitles")
         subs.delegate = app
@@ -76,8 +79,11 @@ enum MainMenu {
         speed.addItem(.separator())
         for r in 1...4 { item(speed, "\(r)×", #selector(PlayerView.setSpeedFromMenu(_:)), "\(r)", []).tag = r }
         pb.addItem(.separator())
-        item(pb, "Volume Up", #selector(PlayerView.volumeUp(_:)), key(NSUpArrowFunctionKey), [])
-        item(pb, "Volume Down", #selector(PlayerView.volumeDown(_:)), key(NSDownArrowFunctionKey), [])
+        item(pb, "Previous Video", #selector(PlayerView.previousVideo(_:)), "", []).tag = previousVideoTag
+        item(pb, "Next Video", #selector(PlayerView.nextVideo(_:)), "", []).tag = nextVideoTag
+        pb.addItem(.separator())
+        item(pb, "Volume Up", #selector(PlayerView.volumeUp(_:)), key(NSUpArrowFunctionKey), []).tag = volumeUpTag
+        item(pb, "Volume Down", #selector(PlayerView.volumeDown(_:)), key(NSDownArrowFunctionKey), []).tag = volumeDownTag
         item(pb, "Mute", #selector(PlayerView.toggleMute(_:)), "m", [])
         pb.addItem(.separator())
         let custom = pb.addItem(withTitle: "Your Shortcuts", action: nil, keyEquivalent: "")
@@ -101,6 +107,20 @@ enum MainMenu {
         help.addItem(withTitle: "Open-Source Licenses", action: #selector(AppDelegate.showLicenses(_:)), keyEquivalent: "").target = app
         NSApp.helpMenu = help
         return main
+    }
+
+    /// A window with a playlist gives ↑/↓ to Previous/Next Video and moves volume to ⌥↑/⌥↓; a single
+    /// video keeps ↑/↓ for volume. Set whenever a player window becomes key, so the menu shows the live keys.
+    static func setPlaylistMode(_ on: Bool) {
+        guard let pb = NSApp.mainMenu?.items.first(where: { $0.submenu?.title == "Playback" })?.submenu else { return }
+        let up = key(NSUpArrowFunctionKey), down = key(NSDownArrowFunctionKey)
+        pb.item(withTag: previousVideoTag)?.keyEquivalent = on ? up : ""
+        pb.item(withTag: nextVideoTag)?.keyEquivalent = on ? down : ""
+        for (tag, k) in [(volumeUpTag, up), (volumeDownTag, down)] {
+            guard let i = pb.item(withTag: tag) else { continue }
+            i.keyEquivalent = k
+            i.keyEquivalentModifierMask = on ? [.option] : []
+        }
     }
 
     /// The Settings shortcut table, shown as real menu items so its keys are discoverable and searchable.
@@ -244,6 +264,11 @@ final class HelpWindow: NSWindowController {
         text.append(NSAttributedString(string: "Volume\n", attributes: k))
         text.append(NSAttributedString(string: "Double-click the video\t", attributes: b))
         text.append(NSAttributedString(string: "Full screen\n", attributes: k))
+        text.append(NSAttributedString(string: "Drop files or a folder on the window\t", attributes: b))
+        text.append(NSAttributedString(string: "Playlist\n", attributes: k))
+        text.append(NSAttributedString(string: "\nPlaylists\n", attributes: h))
+        text.append(NSAttributedString(string: "Open or drop several videos, or a folder (searched with its subfolders), to play them in one window. "
+            + "↑ and ↓ move through the list and ⌥↑ ⌥↓ set the volume; L shows or hides the list; the next video starts when one ends.\n", attributes: b))
 
         text.append(NSAttributedString(string: "\nOpen-Source Software\n", attributes: h))
         text.append(NSAttributedString(string: "WMV, VC-1, WMA, DTS, TrueHD, Vorbis and some VP9 files are decoded with libavformat, "

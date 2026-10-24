@@ -17,16 +17,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ n: Notification) {
         buildMenu()
         let args = CommandLine.arguments.dropFirst().filter { !$0.hasPrefix("-") }
-        for a in args { open(URL(fileURLWithPath: a)) }
+        if !args.isEmpty { open(args.map { URL(fileURLWithPath: $0) }) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [self] in
             if !openedAny { openDocument(nil) }
         }
     }
 
-    func application(_ app: NSApplication, open urls: [URL]) { urls.forEach(open) }
+    func application(_ app: NSApplication, open urls: [URL]) { open(urls) }
+
+    /// Several files, or any folder, open as one window with a playlist; a single file opens on its own.
+    func open(_ urls: [URL]) {
+        guard urls.count > 1 || urls.first?.hasDirectoryPath == true || urls.first.map(isFolder) == true else {
+            if let u = urls.first { open(u) }
+            return
+        }
+        let items = Playlist.expand(urls)
+        guard !items.isEmpty else { return }
+        openedAny = true
+        urls.forEach { NSDocumentController.shared.noteNewRecentDocumentURL($0) }
+        let wc = PlayerWindowController(urls: items)
+        windows.append(wc)
+        wc.onClose = { [weak self, weak wc] in self?.windows.removeAll { $0 === wc } }
+        wc.showWindow(nil)
+    }
+
+    private func isFolder(_ u: URL) -> Bool {
+        var d: ObjCBool = false
+        return FileManager.default.fileExists(atPath: u.path, isDirectory: &d) && d.boolValue
+    }
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
 
     func open(_ url: URL) {
+        if isFolder(url) { open([url]); return }
         openedAny = true
         NSDocumentController.shared.noteNewRecentDocumentURL(url)   // File › Open Recent and the Dock menu
         if let existing = windows.first(where: { $0.url.standardizedFileURL.path == url.standardizedFileURL.path }) {
@@ -50,7 +72,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let p = NSOpenPanel()
         p.allowedContentTypes = [.movie, .video, .audiovisualContent]
         p.allowsOtherFileTypes = true
-        if p.runModal() == .OK, let u = p.url { open(u) }
+        p.allowsMultipleSelection = true
+        p.canChooseDirectories = true
+        if p.runModal() == .OK, !p.urls.isEmpty { open(p.urls) }
     }
 
     private func buildMenu() { NSApp.mainMenu = MainMenu.build(self) }
@@ -60,11 +84,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 final class PlayerWindowController: NSWindowController, NSWindowDelegate {
     var onClose: (() -> Void)?
-    let view: PlayerView
-    let url: URL
+    /// The player for the current video; a new one per video, so nothing carries over by accident.
+    private(set) var view: PlayerView
+    private let host = PlayerHost()
+    private let list = PlaylistPanel()
+    private(set) var items: [URL]
+    private(set) var current: Int
+    private var infoShown = false
+    var url: URL { items[current] }
 
-    init(url: URL) {
-        self.url = url
+    convenience init(url: URL) { self.init(urls: [url]) }
+
+    init(urls: [URL], start: Int = 0) {
+        items = urls
+        current = start
         let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let w = min(1280, screen.width * 0.7)
         let rect = NSRect(x: screen.midX - w / 2, y: screen.midY - w * 9 / 32, width: w, height: w * 9 / 16)
@@ -75,17 +108,118 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         win.backgroundColor = .black
         win.isMovableByWindowBackground = true
         win.collectionBehavior = [.fullScreenPrimary]
-        win.title = url.lastPathComponent
-        view = PlayerView(frame: rect)
-        win.contentView = view
+        host.frame = NSRect(origin: .zero, size: rect.size)
+        win.contentView = host
+        view = PlayerView(frame: host.bounds)
         super.init(window: win)
         win.delegate = self
+        host.list = list
+        host.addSubview(list)
+        host.onDrop = { [weak self] urls in self?.replace(with: urls) }
+        list.onPick = { [weak self] i in self?.play(i) }
+        list.set(items, current: current)
+        list.isHidden = items.count < 2
+        install(view)
         view.load(url)
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
+    private func install(_ v: PlayerView) {
+        v.frame = host.bounds
+        v.autoresizingMask = [.width, .height]
+        host.addSubview(v, positioned: .below, relativeTo: list)
+        v.onSwitch = { [weak self] by in self?.step(by) }
+        v.playlistCount = { [weak self] in self?.items.count ?? 1 }
+        v.playlistVisible = { [weak self] in self?.list.isHidden == false }
+        v.onTogglePlaylist = { [weak self] in self?.togglePlaylist() }
+        v.onFinished = { [weak self] in
+            guard let self, self.current + 1 < self.items.count else { return }
+            self.play(self.current + 1)
+        }
+        v.onInfoToggled = { [weak self] on in self?.infoShown = on }
+        window?.title = url.lastPathComponent
+        window?.makeFirstResponder(v)
+    }
+
+    /// Switch to another video in the list, keeping volume, mute and the info panel as they were.
+    func play(_ i: Int) {
+        guard items.indices.contains(i) else { return }
+        let old = view
+        let sound = old.soundState
+        old.teardown()
+        old.removeFromSuperview()
+        current = i
+        let v = PlayerView(frame: host.bounds)
+        v.startSound = sound
+        v.startInfo = infoShown
+        view = v
+        install(v)
+        v.load(url)
+        list.select(i)
+        if list.isHidden { v.announce("\(i + 1) of \(items.count): \(url.deletingPathExtension().lastPathComponent)") }
+    }
+
+    private func step(_ by: Int) {
+        let i = current + by
+        guard items.indices.contains(i) else { NSSound.beep(); return }
+        play(i)
+    }
+
+    func togglePlaylist() {
+        guard items.count > 1 else { return }
+        list.isHidden.toggle()
+        host.needsLayout = true
+    }
+
+    /// Files or folders dropped on the window become its playlist.
+    private func replace(with urls: [URL]) {
+        let found = Playlist.expand(urls)
+        guard !found.isEmpty else { return }
+        urls.forEach { NSDocumentController.shared.noteNewRecentDocumentURL($0) }
+        items = found
+        list.set(items, current: 0)
+        list.isHidden = items.count < 2
+        host.needsLayout = true
+        MainMenu.setPlaylistMode(items.count > 1)
+        current = 0
+        play(0)
+    }
+
+    func windowDidBecomeKey(_ n: Notification) { MainMenu.setPlaylistMode(items.count > 1) }
     func windowWillClose(_ n: Notification) { view.teardown(); onClose?() }
+}
+
+/// The window's content: the player, the playlist over its right side, and the drop target for files.
+final class PlayerHost: NSView {
+    weak var list: PlaylistPanel?
+    var onDrop: (([URL]) -> Void)?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        registerForDraggedTypes([.fileURL])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layout() {
+        super.layout()
+        // clear of the title bar above and the control bar below
+        guard let list else { return }
+        let w = min(PlaylistPanel.width, bounds.width * 0.4)
+        let h = max(60, list.fittingHeight(bounds.height - 76 - 40))
+        list.frame = NSRect(x: bounds.maxX - w - 12, y: bounds.height - 40 - h, width: w, height: h)
+    }
+
+    private func urls(_ info: NSDraggingInfo) -> [URL] {
+        (info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+    }
+    override func draggingEntered(_ info: NSDraggingInfo) -> NSDragOperation { urls(info).isEmpty ? [] : .copy }
+    override func performDragOperation(_ info: NSDraggingInfo) -> Bool {
+        let u = urls(info)
+        guard !u.isEmpty else { return false }
+        onDrop?(u)
+        return true
+    }
 }
 
 // MARK: - Player view
@@ -105,6 +239,22 @@ final class PlayerView: NSView {
     private(set) var captionChoice: Int?                 // index into captionSources; nil = off
     private var lastCaptionChoice = 0
     private let status = NSTextField(labelWithString: "")
+    private let infoPanel = InfoPanel()
+    private var infoTask: Task<Void, Never>?
+    private var loadedURL: URL?
+    private var endObserver: NSObjectProtocol?
+
+    // the window's playlist (PlayerWindowController owns it)
+    var onSwitch: ((Int) -> Void)?
+    var playlistCount: () -> Int = { 1 }
+    var playlistVisible: () -> Bool = { false }
+    var onTogglePlaylist: (() -> Void)?
+    var onFinished: (() -> Void)?
+    var onInfoToggled: ((Bool) -> Void)?
+    /// Carried over from the previous video in the list.
+    var startSound: (volume: Float, muted: Bool)?
+    var startInfo = false
+    var soundState: (volume: Float, muted: Bool)? { backend.map { ($0.volume, $0.isMuted) } ?? startSound }
 
     private var engine: ScrubEngine?
     private var index: MediaIndex?
@@ -165,6 +315,7 @@ final class PlayerView: NSView {
         }
         addSubview(volumeBadge)
         addSubview(previewBubble)
+        addSubview(infoPanel)
         addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseMoved, .activeAlways, .inVisibleRect, .mouseEnteredAndExited], owner: self))
     }
 
@@ -186,11 +337,14 @@ final class PlayerView: NSView {
         hud.frame = NSRect(x: bounds.midX - 50, y: bounds.maxY - 80, width: 100, height: 30)
         status.frame = NSRect(x: bounds.midX - 160, y: bounds.midY - 15, width: 320, height: 30)
         captionOverlay.frame = bounds
+        let ih = infoPanel.fittingHeight
+        infoPanel.frame = NSRect(x: 12, y: max(76, bounds.height - 40 - ih), width: min(InfoPanel.width, bounds.width - 24), height: ih)
     }
 
     // MARK: loading
 
     func load(_ url: URL) {
+        loadedURL = url
         Task { @MainActor in
             let opened = CACurrentMediaTime()
             var size = CGSize.zero
@@ -201,13 +355,18 @@ final class PlayerView: NSView {
                 playAsset = asset
                 if let (native, idx) = await NativePlayback.make(asset: asset) {
                     // decodes only a few frames ahead: about 100 MB less than AVPlayer for 4K
-                    native.onEnd = { [weak self] in self?.controls.setTime(self?.duration ?? 0, playing: false) }
+                    native.onEnd = { [weak self] in self?.controls.setTime(self?.duration ?? 0, playing: false); self?.onFinished?() }
                     backend = native
                     newIndex = idx
                     duration = idx.duration
                 } else {
-                    backend = AVPlayerPlayback(asset: asset)
+                    let av = AVPlayerPlayback(asset: asset)
+                    backend = av
                     duration = (try? await asset.load(.duration).seconds) ?? 0
+                    endObserver = NotificationCenter.default.addObserver(forName: AVPlayerItem.didPlayToEndTimeNotification, object: nil, queue: .main) { [weak self, weak av] n in
+                        guard let av, (n.object as? AVPlayerItem) === av.player.currentItem else { return }
+                        self?.onFinished?()
+                    }
                 }
                 size = (try? await asset.loadTracks(withMediaType: .video).first?.load(.naturalSize)) ?? .zero
             } else if let (mkv, idx) = await Task.detached(operation: { () -> (MKVFile, MediaIndex?)? in
@@ -217,7 +376,7 @@ final class PlayerView: NSView {
                           return (m, i)
                       }).value, let idx {
                 let native = NativePlayback(mkv: mkv, index: idx)
-                native.onEnd = { [weak self] in self?.controls.setTime(self?.duration ?? 0, playing: false) }
+                native.onEnd = { [weak self] in self?.controls.setTime(self?.duration ?? 0, playing: false); self?.onFinished?() }
                 backend = native
                 newIndex = idx
                 self.mkv = mkv
@@ -230,7 +389,7 @@ final class PlayerView: NSView {
                 guard let (v, a) = await Task.detached(operation: { FFPlayback.open(url, audio: mkv.flatMap(MKVCodecs.audioSource)) }).value
                 else { flash(status, "Can't open this file"); return }
                 let ff = FFPlayback(video: v, audio: a)
-                ff.onEnd = { [weak self] in self?.controls.setTime(self?.duration ?? 0, playing: false) }
+                ff.onEnd = { [weak self] in self?.controls.setTime(self?.duration ?? 0, playing: false); self?.onFinished?() }
                 backend = ff
                 self.mkv = mkv
                 duration = ff.duration
@@ -238,6 +397,8 @@ final class PlayerView: NSView {
                 previewSource = FFThumbnailer(url: url)
             }
             guard let backend else { return }
+            if let s = startSound { backend.volume = s.volume; backend.isMuted = s.muted }
+            if startInfo { setInfo(true) }
             Trace.log(String(format: "open %.1f ms", (CACurrentMediaTime() - opened) * 1000))
             CATransaction.begin(); CATransaction.setDisableActions(true)
             backend.layer.frame = videoHost.bounds
@@ -294,6 +455,8 @@ final class PlayerView: NSView {
     }
 
     func teardown() {
+        infoTask?.cancel()
+        if let o = endObserver { NotificationCenter.default.removeObserver(o) }
         engine?.stop()
         clock?.invalidate()
         backend?.teardown()
@@ -677,6 +840,10 @@ final class PlayerView: NSView {
     @objc func menuSkip(_ s: NSMenuItem) { skip(s.representedObject as? Double ?? 0) }
     @objc func nextFrame(_ s: Any?) { stepFrame(1) }
     @objc func previousFrame(_ s: Any?) { stepFrame(-1) }
+    @objc func nextVideo(_ s: Any?) { onSwitch?(1) }
+    @objc func previousVideo(_ s: Any?) { onSwitch?(-1) }
+    @objc func togglePlaylist(_ s: Any?) { onTogglePlaylist?() }
+    @objc func toggleInfo(_ s: Any?) { setInfo(infoPanel.isHidden) }
     @objc func volumeUp(_ s: Any?) { changeVolume(0.05) }
     @objc func volumeDown(_ s: Any?) { changeVolume(-0.05) }
     @objc func toggleMute(_ s: Any?) {
@@ -703,6 +870,13 @@ final class PlayerView: NSView {
             item.title = playing ? "Pause" : "Play"
         case #selector(toggleMute(_:)): item.title = backend?.isMuted == true ? "Unmute" : "Mute"
         case #selector(toggleControllerVisibility(_:)): item.title = controlsHiddenByUser ? "Show Controls" : "Hide Controls"
+        case #selector(nextVideo(_:)), #selector(previousVideo(_:)): return playlistCount() > 1
+        case #selector(togglePlaylist(_:)):
+            item.title = playlistVisible() ? "Hide Playlist" : "Show Playlist"
+            return playlistCount() > 1
+        case #selector(toggleInfo(_:)):
+            item.title = infoPanel.isHidden ? "Show Info" : "Hide Info"
+            return loadedURL != nil
         case #selector(nextFrame(_:)), #selector(previousFrame(_:)): return index != nil
         case #selector(setSpeedFromMenu(_:)): item.state = abs(rate - Float(item.tag)) < 0.001 ? .on : .off
         case #selector(normalSpeed): item.state = rate == 1 ? .on : .off
@@ -750,8 +924,9 @@ final class PlayerView: NSView {
         switch e.keyCode {
         case 123: skip(shift ? -1 : alt ? -30 : -5)
         case 124: skip(shift ? 1 : alt ? 30 : 5)
-        case 126: changeVolume(0.05)
-        case 125: changeVolume(-0.05)
+        // with a playlist, up/down move through it and Option-up/down set the volume
+        case 126: if playlistCount() > 1 && !alt { onSwitch?(-1) } else { changeVolume(0.05) }
+        case 125: if playlistCount() > 1 && !alt { onSwitch?(1) } else { changeVolume(-0.05) }
         case 49: togglePlay()
         case 116 where shift: skip(600)
         case 121 where shift: skip(-600)
@@ -761,6 +936,8 @@ final class PlayerView: NSView {
             case ",": stepFrame(-1)
             case ".": stepFrame(1)
             case "f": window?.toggleFullScreen(nil)
+            case "i": toggleInfo(nil)
+            case "l": onTogglePlaylist?()
             case "m": if let b = backend { b.isMuted.toggle(); flash(hud, b.isMuted ? "Muted" : "Sound"); controls.setVolume(b.volume, muted: b.isMuted) }
             case "]": faster()
             case "[": slower()
@@ -831,11 +1008,40 @@ final class PlayerView: NSView {
         DispatchQueue.main.asyncAfter(deadline: .now() + s, execute: w)
     }
 
+    // MARK: file info
+
+    /// What decodes this file, for the info panel.
+    private var decoderName: String {
+        switch backend {
+        case let n as NativePlayback: return n.usesFFmpegAudio ? "Hardware video, FFmpeg audio" : "Hardware (VideoToolbox)"
+        case is FFPlayback: return "Software (FFmpeg)"
+        case is AVPlayerPlayback: return "AVFoundation"
+        default: return "—"
+        }
+    }
+
+    private func setInfo(_ on: Bool) {
+        infoPanel.isHidden = !on
+        onInfoToggled?(on)
+        guard on, infoTask == nil, let url = loadedURL else { return }
+        infoTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let info = await MediaInfo.load(url, mkv: self.mkv, decoder: self.decoderName)
+            guard !Task.isCancelled else { return }
+            self.infoPanel.show(info)
+            self.needsLayout = true
+        }
+    }
+
+    /// A short message in the middle of the picture (the playlist's "3 of 12: name" when it's hidden).
+    func announce(_ text: String) { flash(status, text) }
+
     private func flash(_ f: NSTextField, _ text: String, hold: Bool = false) {
         f.stringValue = text
         NSAccessibility.post(element: self, notification: .announcementRequested,
                              userInfo: [.announcement: text, .priority: NSAccessibilityPriorityLevel.medium.rawValue])
-        let w = max(90, f.attributedStringValue.size().width + 28)
+        let w = min(max(90, f.attributedStringValue.size().width + 28), bounds.width - 40)
+        f.lineBreakMode = .byTruncatingMiddle
         f.frame.size.width = w
         f.frame.origin.x = bounds.midX - w / 2
         f.alphaValue = 1
