@@ -1,11 +1,17 @@
 import AppKit
 import VideoToolbox
 
+/// Pictures for the seek bar's preview bubble; the Int is a key for the picture (same key, same picture).
+protocol PreviewSource: AnyObject {
+    var spacing: Double { get set }
+    func request(seconds: Double, _ done: @escaping (CGImage, Int) -> Void)
+}
+
 /// Small pictures for the timeline preview. Each is the keyframe at or before the asked-for frame, decoded
 /// by its own VideoToolbox session straight to thumbnail size: one keyframe is a single decode (~15 ms for
 /// 4K), where the exact frame could be hundreds. Recent pictures are kept; the session and the pictures
 /// are dropped after a few idle seconds.
-final class Thumbnailer {
+final class Thumbnailer: PreviewSource {
     private let index: MediaIndex
     private let size: (w: Int, h: Int)
     private let q = DispatchQueue(label: "flick.thumbs", qos: .userInitiated)
@@ -28,6 +34,8 @@ final class Thumbnailer {
     }
 
     deinit { if let s = session { VTDecompressionSessionInvalidate(s) } }
+
+    func request(seconds: Double, _ done: @escaping (CGImage, Int) -> Void) { request(frame: index.frame(at: seconds), done) }
 
     /// The picture for `frame`, on the main thread; only the latest request is decoded.
     func request(frame d: Int, _ done: @escaping (CGImage, Int) -> Void) {

@@ -1,18 +1,28 @@
 import AudioToolbox
 import CoreMedia
 import CoreVideo
+import VideoToolbox
 
 /// Matroska codec IDs → CoreMedia format descriptions. Anything returning nil falls back to the remuxer.
 enum MKVCodecs {
-    static func videoFormat(_ t: MKVFile.Track) -> CMVideoFormatDescription? {
+    /// VideoToolbox's VP9 decoder (hardware on Apple silicon) is opt-in per process.
+    static let vp9Registered: Void = VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_VP9)
+
+    /// `firstFrame` is the first video packet: VP9 keeps its profile and bit depth there, not in the header.
+    static func videoFormat(_ t: MKVFile.Track, firstFrame: UnsafeRawBufferPointer? = nil) -> CMVideoFormatDescription? {
         let (codec, atom): (CMVideoCodecType, String)
+        var cp = t.codecPrivate
         switch t.codecID {
         case "V_MPEG4/ISO/AVC": (codec, atom) = (kCMVideoCodecType_H264, "avcC")
         case "V_MPEGH/ISO/HEVC": (codec, atom) = (kCMVideoCodecType_HEVC, "hvcC")
         case "V_AV1": (codec, atom) = (kCMVideoCodecType_AV1, "av1C")
+        case "V_VP9":
+            _ = vp9Registered
+            (codec, atom) = (kCMVideoCodecType_VP9, "vpcC")
+            cp = vpcC(t, firstFrame)
         default: return nil
         }
-        guard let cp = t.codecPrivate, t.width > 0, t.height > 0 else { return nil }
+        guard let cp, t.width > 0, t.height > 0 else { return nil }
         var ext: [CFString: Any] = [kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: [atom: cp]]
         if t.primaries != 2, let p = CVColorPrimariesGetStringForIntegerCodePoint(Int32(t.primaries))?.takeUnretainedValue() {
             ext[kCMFormatDescriptionExtension_ColorPrimaries] = p
@@ -33,6 +43,63 @@ enum MKVCodecs {
         guard CMVideoFormatDescriptionCreate(allocator: nil, codecType: codec, width: Int32(t.width), height: Int32(t.height),
                                              extensions: ext as CFDictionary, formatDescriptionOut: &f) == noErr else { return nil }
         return f
+    }
+
+    /// The 'vpcC' box body (VP Codec Configuration, version 1) from the track's CodecPrivate features and
+    /// the first keyframe's colour config.
+    private static func vpcC(_ t: MKVFile.Track, _ frame: UnsafeRawBufferPointer?) -> Data? {
+        var profile = -1, level = 0, depth = 0, chroma = -1
+        if let cp = t.codecPrivate {                    // ID, length, value…
+            var i = cp.startIndex
+            while i + 2 <= cp.endIndex {
+                let id = cp[i], n = Int(cp[i + 1])
+                guard n >= 1, i + 2 + n <= cp.endIndex else { break }
+                let v = Int(cp[i + 2])
+                switch id { case 1: profile = v; case 2: level = v; case 3: depth = v; case 4: chroma = v; default: break }
+                i += 2 + n
+            }
+        }
+        var space = 0, fullRange = t.range == 2
+        if let f = frame, f.count >= 4 {
+            var bit = 0
+            func read(_ n: Int) -> Int {
+                var v = 0
+                for _ in 0..<n {
+                    guard bit / 8 < f.count else { return v << 1 }
+                    v = v << 1 | Int(f[bit / 8] >> (7 - bit % 8) & 1); bit += 1
+                }
+                return v
+            }
+            if read(2) == 2 {
+                let low = read(1), high = read(1)
+                let p = high << 1 | low
+                if p == 3 { _ = read(1) }
+                if read(1) == 0, read(1) == 0 {        // not show_existing_frame; a keyframe
+                    _ = read(2)                         // show_frame, error_resilient_mode
+                    if read(24) == 0x498342 {
+                        profile = p
+                        depth = p >= 2 ? (read(1) == 1 ? 12 : 10) : 8
+                        space = read(3)
+                        if space != 7 {
+                            fullRange = read(1) == 1
+                            if p == 1 || p == 3 { let x = read(1), y = read(1); chroma = x == 1 ? (y == 1 ? 0 : 2) : 3 }
+                            else { chroma = 0 }
+                        } else { fullRange = true; chroma = 3 }
+                    }
+                }
+            }
+        }
+        guard profile >= 0 else { return nil }
+        if depth == 0 { depth = profile >= 2 ? 10 : 8 }
+        if chroma < 0 { chroma = 0 }
+        if level == 0 { level = t.width * t.height <= 1280 * 720 ? 31 : t.width * t.height <= 1920 * 1080 ? 41 : t.width * t.height <= 4096 * 2176 ? 51 : 61 }
+        // colour: the track's Colour element first, else the bitstream's colour space
+        let fromSpace = [1: 6, 2: 1, 3: 6, 4: 7, 5: 9, 7: 0][space] ?? 2
+        let matrix = t.matrix != 2 ? t.matrix : fromSpace
+        let prim = t.primaries != 2 ? t.primaries : (space == 5 ? 9 : space == 2 ? 1 : 2)
+        let trc = t.transfer != 2 ? t.transfer : (space == 5 ? 14 : space == 2 ? 1 : 2)
+        return Data([1, 0, 0, 0, UInt8(profile), UInt8(level), UInt8(depth << 4 | chroma << 1 | (fullRange ? 1 : 0)),
+                     UInt8(prim), UInt8(trc), UInt8(matrix), 0, 0])
     }
 
     /// Audio the system decoders handle. `isPCM` tells the feeder to build sample buffers per frame.

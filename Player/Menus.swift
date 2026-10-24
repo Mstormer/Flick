@@ -97,6 +97,8 @@ enum MainMenu {
         // Help
         let help = submenu(main, "Help")
         help.addItem(withTitle: "Flick Help", action: #selector(AppDelegate.showHelp(_:)), keyEquivalent: "?").target = app
+        help.addItem(.separator())
+        help.addItem(withTitle: "Open-Source Licenses", action: #selector(AppDelegate.showLicenses(_:)), keyEquivalent: "").target = app
         NSApp.helpMenu = help
         return main
     }
@@ -194,6 +196,9 @@ extension AppDelegate: NSMenuDelegate {
     }
 
     @objc func showHelp(_ s: Any?) { HelpWindow.shared.show() }
+    @objc func showLicenses(_ s: Any?) {
+        if let u = HelpWindow.licenses { NSWorkspace.shared.open(u) }
+    }
 }
 
 /// A plain list of every shortcut, generated from the menu bar so it can't drift out of date.
@@ -208,6 +213,9 @@ final class HelpWindow: NSWindowController {
         w.center()
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    /// The LGPL notice and full license text, in the app's Resources.
+    static var licenses: URL? { Bundle.main.url(forResource: "Licenses", withExtension: "txt") }
 
     func show() {
         let text = NSMutableAttributedString()
@@ -236,6 +244,16 @@ final class HelpWindow: NSWindowController {
         text.append(NSAttributedString(string: "Volume\n", attributes: k))
         text.append(NSAttributedString(string: "Double-click the video\t", attributes: b))
         text.append(NSAttributedString(string: "Full screen\n", attributes: k))
+
+        text.append(NSAttributedString(string: "\nOpen-Source Software\n", attributes: h))
+        text.append(NSAttributedString(string: "WMV, VC-1, WMA, DTS, TrueHD, Vorbis and some VP9 files are decoded with libavformat, "
+            + "libavcodec and libavutil from the FFmpeg project (version 9.0.2, unmodified), licensed under the GNU Lesser "
+            + "General Public License version 2.1 or later. They are separate libraries inside Flick.app/Contents/Frameworks "
+            + "and can be replaced with your own build. ", attributes: b))
+        var link: [NSAttributedString.Key: Any] = b
+        if let u = Self.licenses { link[.link] = u }
+        text.append(NSAttributedString(string: "License text and source", attributes: link))
+        text.append(NSAttributedString(string: "\n", attributes: b))
         let para = NSMutableParagraphStyle()
         para.tabStops = [NSTextTab(textAlignment: .right, location: 400)]
         para.paragraphSpacing = 3

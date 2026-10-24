@@ -21,3 +21,4 @@ Bench/memdiag/memdiag
 Bench/settingstest/settingstest
 Bench/uitest/uitest
 *.dSYM/
+Vendor/

@@ -61,7 +61,9 @@ final class MediaIndex {
 
     /// Matroska: the same table, from the EBML block list (decode order = file order, no DTS stored).
     convenience init?(mkv: MKVFile) {
-        guard let v = mkv.video, let fmt = MKVCodecs.videoFormat(v), let pk = mkv.packets[v.number], !pk.isEmpty else { return nil }
+        guard let v = mkv.video, let pk = mkv.packets[v.number], !pk.isEmpty,
+              let fmt = MKVCodecs.videoFormat(v, firstFrame: UnsafeRawBufferPointer(start: mkv.base + Int(pk[0].offset), count: Int(pk[0].size)))
+        else { return nil }
         let ts = Int32(clamping: 1_000_000_000 / max(1, mkv.timecodeScale))
         let fixed = v.defaultDuration > 0 ? Int64((Double(v.defaultDuration) / Double(mkv.timecodeScale)).rounded()) : 0
         // Durations from the gap to the next frame in presentation order when the track doesn't state one.

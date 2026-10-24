@@ -1,6 +1,5 @@
 import AppKit
 import AVFoundation
-import CryptoKit
 import MediaAccessibility
 import UniformTypeIdentifiers
 
@@ -10,7 +9,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var windows: [PlayerWindowController] = []
     private var openedAny = false
 
-    func applicationWillFinishLaunching(_ n: Notification) { Remuxer.clear() }   // before any file can open
+    func applicationWillFinishLaunching(_ n: Notification) {
+        // 0.2.2 and earlier kept ffmpeg remux copies here
+        try? FileManager.default.removeItem(at: FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("Flick"))
+    }
 
     func applicationDidFinishLaunching(_ n: Notification) {
         buildMenu()
@@ -23,7 +25,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func application(_ app: NSApplication, open urls: [URL]) { urls.forEach(open) }
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
-    func applicationWillTerminate(_ n: Notification) { Remuxer.clear() }
 
     func open(_ url: URL) {
         openedAny = true
@@ -97,7 +98,7 @@ final class PlayerView: NSView {
     private let hud = NSTextField(labelWithString: "")
     private let volumeBadge = VolumeBadge()
     private let previewBubble = PreviewBubble()
-    private var thumbnailer: Thumbnailer?
+    private var previewSource: PreviewSource?
     private let captionOverlay = CaptionOverlay()
     private var mkv: MKVFile?
     private(set) var captionSources: [CaptionSource] = []
@@ -209,12 +210,12 @@ final class PlayerView: NSView {
                     duration = (try? await asset.load(.duration).seconds) ?? 0
                 }
                 size = (try? await asset.loadTracks(withMediaType: .video).first?.load(.naturalSize)) ?? .zero
-            } else if let (mkv, idx) = await Task.detached(operation: { () -> (MKVFile, MediaIndex)? in
-                          // Matroska natively: parse, index, and play without touching ffmpeg
-                          guard let m = MKVFile(url: url), !NativePlayback.hasUndecodableAudioOnly(m),
-                                let i = MediaIndex(mkv: m), ScrubEngine.canDecode(i) else { return nil }
+            } else if let (mkv, idx) = await Task.detached(operation: { () -> (MKVFile, MediaIndex?)? in
+                          // Matroska natively: parse, index, and play without a demuxer library
+                          guard let m = MKVFile(url: url), m.video != nil else { return nil }
+                          guard let i = MediaIndex(mkv: m), ScrubEngine.canDecode(i) else { return (m, nil) }
                           return (m, i)
-                      }).value {
+                      }).value, let idx {
                 let native = NativePlayback(mkv: mkv, index: idx)
                 native.onEnd = { [weak self] in self?.controls.setTime(self?.duration ?? 0, playing: false) }
                 backend = native
@@ -224,15 +225,17 @@ final class PlayerView: NSView {
                 let v = mkv.video!
                 size = CGSize(width: v.displayWidth > 0 ? v.displayWidth : v.width, height: v.displayHeight > 0 ? v.displayHeight : v.height)
             } else {
-                // DTS/TrueHD-only audio, VP9…: stream-copy into MP4 and transcode the audio
-                flash(status, "Preparing \(url.pathExtension.uppercased())…", hold: true)
-                guard let remuxed = await Remuxer.remux(url) else { flash(status, "Can't open this file"); return }
-                status.alphaValue = 0
-                let a = AVURLAsset(url: remuxed)
-                playAsset = a
-                backend = AVPlayerPlayback(asset: a)
-                duration = (try? await a.load(.duration).seconds) ?? 0
-                size = (try? await a.loadTracks(withMediaType: .video).first?.load(.naturalSize)) ?? .zero
+                // WMV, VC-1, VP9 the hardware decoder refuses…: decoded in software by the bundled FFmpeg
+                let mkv = MKVFile(url: url)
+                guard let (v, a) = await Task.detached(operation: { FFPlayback.open(url, audio: mkv.flatMap(MKVCodecs.audioSource)) }).value
+                else { flash(status, "Can't open this file"); return }
+                let ff = FFPlayback(video: v, audio: a)
+                ff.onEnd = { [weak self] in self?.controls.setTime(self?.duration ?? 0, playing: false) }
+                backend = ff
+                self.mkv = mkv
+                duration = ff.duration
+                size = ff.displaySize
+                previewSource = FFThumbnailer(url: url)
             }
             guard let backend else { return }
             Trace.log(String(format: "open %.1f ms", (CACurrentMediaTime() - opened) * 1000))
@@ -269,7 +272,7 @@ final class PlayerView: NSView {
                 eng.setIdle(!backend.isPlaying)
                 index = idx
                 engine = eng
-                thumbnailer = Thumbnailer(index: idx)
+                previewSource = Thumbnailer(index: idx)
             }
         }
     }
@@ -450,6 +453,7 @@ final class PlayerView: NSView {
     }
 
     private func stepFrame(_ n: Int) {
+        if index == nil, let ff = backend as? FFPlayback { ff.step(n); return }
         guard let d = currentFrame, let index else { return }
         seek(toFrame: index.step(d, by: n), settleAfter: 0.4)
     }
@@ -536,9 +540,9 @@ final class PlayerView: NSView {
         let cx = bar.minX + controls.scrubber.x(at: f)
         previewBubble.frame = NSRect(x: max(8, min(bounds.width - w - 8, cx - w / 2)), y: bar.maxY + 6, width: w, height: h)
         previewBubble.show(true)
-        guard let th = thumbnailer, let index else { return }
-        th.spacing = dragging ? 0.08 : 0          // leave the hardware decoder to the main picture while dragging
-        th.request(frame: index.frame(at: t)) { [weak self] img, k in
+        guard let th = previewSource else { return }
+        th.spacing = dragging ? 0.08 : 0          // leave the decoder to the main picture while dragging
+        th.request(seconds: t) { [weak self] img, k in
             guard let self, self.previewBubble.alphaValue > 0 else { return }
             self.previewBubble.setPicture(img, key: k)
         }
@@ -1055,52 +1059,6 @@ final class Scrubber: NSView {
         }
     }
 }
-
-// MARK: - Formats AVFoundation won't open (MKV, WebM, AVI…): fast stream copy into MP4 via ffmpeg.
-
-/// The copies are as big as the originals, so they last only while Flick runs: cleared on quit, and at
-/// launch in case the last run crashed.
-enum Remuxer {
-    static let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("Flick")
-    private static let lock = NSLock()
-    private static var running: Set<Process> = []
-
-    /// Stops any copy in progress and removes every copy.
-    static func clear() {
-        let ps = lock.withLock { defer { running = [] }; return running }
-        for p in ps where p.isRunning { p.terminate(); p.waitUntilExit() }
-        try? FileManager.default.removeItem(at: dir)
-    }
-
-    static func remux(_ url: URL) async -> URL? {
-        guard let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"].first(where: FileManager.default.isExecutableFile) else { return nil }
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
-        let key = "\(url.path)|\(attrs?[.size] ?? 0)|\((attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)"
-        let hash = Insecure.MD5.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
-        let out = dir.appendingPathComponent(hash + ".mp4")
-        if FileManager.default.fileExists(atPath: out.path) { return out }
-        let tmp = out.deletingPathExtension().appendingPathExtension("partial.mp4")   // AVFoundation needs a real extension
-        for audio in [["-c:a", "copy"], ["-c:a", "aac", "-b:a", "192k"]] { for tag in [["-tag:v", "hvc1"], []] {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: ffmpeg)
-            p.arguments = ["-y", "-v", "error", "-i", url.path, "-map", "0:v:0", "-map", "0:a?", "-c:v", "copy"]
-                + tag + audio + ["-sn", "-f", "mp4", tmp.path]
-            let code: Int32 = await withCheckedContinuation { c in
-                p.terminationHandler = { c.resume(returning: $0.terminationStatus) }
-                _ = lock.withLock { running.insert(p) }
-                do { try p.run() } catch { c.resume(returning: -1) }
-            }
-            _ = lock.withLock { running.remove(p) }
-            if code == 0, (try? await AVURLAsset(url: tmp).load(.isPlayable)) == true {
-                try? FileManager.default.moveItem(at: tmp, to: out)
-                return out
-            }
-        } }
-        return nil
-    }
-}
-
 
 // MARK: - Volume badge (bottom right)
 

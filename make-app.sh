@@ -3,8 +3,18 @@
 set -e
 cd "${0:A:h}"
 APP=build/Flick.app
-rm -rf $APP; mkdir -p $APP/Contents/{MacOS,Resources}
-swiftc -O -swift-version 5 -target arm64-apple-macos14 -o $APP/Contents/MacOS/Flick Player/*.swift
+FF=Vendor/ffmpeg
+[[ -f $FF/lib/libavcodec.dylib ]] || Tools/build-ffmpeg.sh
+rm -rf $APP; mkdir -p $APP/Contents/{MacOS,Resources,Frameworks}
+swiftc -O -swift-version 5 -target arm64-apple-macos14 -o $APP/Contents/MacOS/Flick Player/*.swift \
+  -I Player/CFFmpeg -Xcc -I$FF/include -L $FF/lib -Xlinker -rpath -Xlinker @executable_path/../Frameworks
+# the LGPL FFmpeg libraries, as separate dylibs (users may replace them with their own build)
+for l in libavformat.63 libavcodec.63 libavutil.61; do
+  cp -L $FF/lib/$l.dylib $APP/Contents/Frameworks/
+  strip -x $APP/Contents/Frameworks/$l.dylib
+  codesign -s - --force $APP/Contents/Frameworks/$l.dylib
+done
+cp Player/Licenses.txt $APP/Contents/Resources/
 [[ -f Player/AppIcon.icns ]] && cp Player/AppIcon.icns $APP/Contents/Resources/
 cat > $APP/Contents/Info.plist <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -23,7 +33,7 @@ cat > $APP/Contents/Info.plist <<PLIST
   <key>CFBundleTypeName</key><string>Video</string>
   <key>CFBundleTypeRole</key><string>Viewer</string>
   <key>LSHandlerRank</key><string>Alternate</string>
-  <key>LSItemContentTypes</key><array><string>public.movie</string><string>public.video</string><string>org.matroska.mkv</string><string>org.webmproject.webm</string></array>
+  <key>LSItemContentTypes</key><array><string>public.movie</string><string>public.video</string><string>org.matroska.mkv</string><string>org.webmproject.webm</string><string>com.microsoft.windows-media-wmv</string><string>com.microsoft.advanced-systems-format</string></array>
 </dict></array>
 </dict></plist>
 PLIST

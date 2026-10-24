@@ -125,10 +125,8 @@ final class MKVAudio: AudioSource {
     private let tscale: Double                     // seconds per MKV timestamp unit
     private var nextIndex = 0
 
-    init?(_ mkv: MKVFile) {
-        let tracks = mkv.audioTracks
-        guard let chosen = tracks.first(where: { $0.isDefault && MKVCodecs.audioFormat($0) != nil }) ?? tracks.first(where: { MKVCodecs.audioFormat($0) != nil }),
-              let f = MKVCodecs.audioFormat(chosen) else { return nil }
+    init?(_ mkv: MKVFile, track chosen: MKVFile.Track) {
+        guard let f = MKVCodecs.audioFormat(chosen) else { return nil }
         self.mkv = mkv
         format = f.0
         isPCM = f.isPCM
@@ -277,7 +275,7 @@ final class NativePlayback: Playback {
     }
 
     convenience init(mkv: MKVFile, index: MediaIndex) {
-        self.init(index: index, audio: MKVAudio(mkv))
+        self.init(index: index, audio: MKVCodecs.audioSource(mkv))
     }
 
     /// A plain MP4/MOV (one video track, at most one audio track, no embedded subtitles, no rotation, SDR)
@@ -307,11 +305,6 @@ final class NativePlayback: Playback {
         }
         guard let idx = await MediaIndex(asset: asset), ScrubEngine.canDecode(idx) else { return nil }
         return (NativePlayback(index: idx, audio: source), idx)
-    }
-
-    /// Whether this file has audio the system can't decode (the caller may prefer the remuxer then).
-    static func hasUndecodableAudioOnly(_ mkv: MKVFile) -> Bool {
-        !mkv.audioTracks.isEmpty && mkv.audioTracks.allSatisfy { MKVCodecs.audioFormat($0) == nil }
     }
 
     var currentSeconds: Double { max(0, sync.currentTime().seconds - Double(index.startPTS) / Double(index.timescale)) }
