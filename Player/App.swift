@@ -138,6 +138,14 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
             self.play(self.current + 1, autoplay: true)
         }
         v.onInfoToggled = { [weak self] on in self?.infoShown = on }
+        v.onChrome = { [weak self] on, d in
+            guard let list = self?.list, list.alphaValue != (on ? 1 : 0) else { return }
+            NSAnimationContext.runAnimationGroup { $0.duration = d; list.animator().alphaValue = on ? 1 : 0 }
+        }
+        v.pointerOverOverlay = { [weak self] in
+            guard let list = self?.list, !list.isHidden, list.alphaValue > 0, let w = list.window else { return false }
+            return list.frame.contains(list.superview!.convert(w.mouseLocationOutsideOfEventStream, from: nil))
+        }
         window?.title = url.lastPathComponent
         window?.makeFirstResponder(v)
     }
@@ -176,6 +184,8 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         guard items.count > 1 else { return }
         list.isHidden.toggle()
         host.needsLayout = true
+        updateMenuKeys()
+        if !list.isHidden { view.reveal() }
     }
 
     /// Files or folders dropped on the window become its playlist.
@@ -187,12 +197,13 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         list.set(items, current: 0)
         list.isHidden = items.count < 2
         host.needsLayout = true
-        MainMenu.setPlaylistMode(items.count > 1)
+        updateMenuKeys()
         current = 0
         play(0, autoplay: true)
     }
 
-    func windowDidBecomeKey(_ n: Notification) { MainMenu.setPlaylistMode(items.count > 1) }
+    private func updateMenuKeys() { MainMenu.setPlaylistMode(items.count > 1, visible: !list.isHidden) }
+    func windowDidBecomeKey(_ n: Notification) { updateMenuKeys() }
     func windowWillClose(_ n: Notification) { view.teardown(); onClose?() }
 }
 
@@ -209,11 +220,11 @@ final class PlayerHost: NSView {
 
     override func layout() {
         super.layout()
-        // clear of the title bar above and the control bar below
+        // top left, clear of the title bar above and the control bar below (file info goes top right)
         guard let list else { return }
         let w = min(PlaylistPanel.width, bounds.width * 0.4)
         let h = max(60, list.fittingHeight(bounds.height - 76 - 40))
-        list.frame = NSRect(x: bounds.maxX - w - 12, y: bounds.height - 40 - h, width: w, height: h)
+        list.frame = NSRect(x: 12, y: bounds.height - 40 - h, width: w, height: h)
     }
 
     private func urls(_ info: NSDraggingInfo) -> [URL] {
@@ -260,6 +271,9 @@ final class PlayerView: NSView {
     var onTogglePlaylist: (() -> Void)?
     var onFinished: (() -> Void)?
     var onInfoToggled: ((Bool) -> Void)?
+    /// The window's overlays (playlist) fade in and out with the controls; nil duration = at once.
+    var onChrome: ((Bool, Double) -> Void)?
+    var pointerOverOverlay: () -> Bool = { false }
     /// Carried over from the previous video in the list.
     var startSound: (volume: Float, muted: Bool)?
     var startInfo = false
@@ -364,7 +378,8 @@ final class PlayerView: NSView {
         status.frame = NSRect(x: bounds.midX - 160, y: bounds.midY - 15, width: 320, height: 30)
         captionOverlay.frame = bounds
         let ih = infoPanel.fittingHeight
-        infoPanel.frame = NSRect(x: 12, y: max(76, bounds.height - 40 - ih), width: min(InfoPanel.width, bounds.width - 24), height: ih)
+        let iw = min(InfoPanel.width, bounds.width - 24)
+        infoPanel.frame = NSRect(x: bounds.width - iw - 12, y: max(76, bounds.height - 40 - ih), width: iw, height: ih)
     }
 
     // MARK: loading
@@ -697,6 +712,7 @@ final class PlayerView: NSView {
             backend?.play(rate: rate)
         }
         controls.setTime(controls.time, playing: target != nil ? resumeAfterSeek : backend?.isPlaying ?? false)
+        if isPlayingNow { scheduleHide() } else { chrome(true, 0.12) }
     }
 
     private func setRate(_ r: Float) {
@@ -964,9 +980,9 @@ final class PlayerView: NSView {
         switch e.keyCode {
         case 123: skip(shift ? -1 : alt ? -30 : -5)
         case 124: skip(shift ? 1 : alt ? 30 : 5)
-        // with a playlist, up/down move through it and Option-up/down set the volume
-        case 126: if playlistCount() > 1 && !alt { onSwitch?(-1) } else { changeVolume(0.05) }
-        case 125: if playlistCount() > 1 && !alt { onSwitch?(1) } else { changeVolume(-0.05) }
+        // while the list is showing, up/down move through it (Option: volume); hidden, the other way round
+        case 126: if playlistCount() > 1 && playlistVisible() != alt { onSwitch?(-1) } else { changeVolume(0.05) }
+        case 125: if playlistCount() > 1 && playlistVisible() != alt { onSwitch?(1) } else { changeVolume(-0.05) }
         case 49: togglePlay()
         case 116 where shift: skip(600)
         case 121 where shift: skip(-600)
@@ -977,11 +993,11 @@ final class PlayerView: NSView {
             case ".": stepFrame(1)
             case "f": window?.toggleFullScreen(nil)
             case "i": toggleInfo(nil)
-            case "l": onTogglePlaylist?()
+            case "\\", "l": onTogglePlaylist?()
             case "m": if let b = backend { b.isMuted.toggle(); flash(hud, b.isMuted ? "Muted" : "Sound"); controls.setVolume(b.volume, muted: b.isMuted) }
             case "]": faster()
             case "[": slower()
-            case "\\", "\u{7f}": normalSpeed()
+            case "\u{7f}": normalSpeed()
             case let c? where Int(c).map({ (1...4).contains($0) }) == true: setRate(Float(Int(c)!))
             default: super.keyDown(with: e)
             }
@@ -1023,8 +1039,16 @@ final class PlayerView: NSView {
         }
     }
 
+    /// The playlist and the info panel: shown with the controls; while playing they fade with them.
+    private func chrome(_ on: Bool, _ duration: Double) {
+        onChrome?(on, duration)
+        guard infoPanel.alphaValue != (on ? 1 : 0) else { return }
+        NSAnimationContext.runAnimationGroup { $0.duration = duration; infoPanel.animator().alphaValue = on ? 1 : 0 }
+    }
+
     private func showControls() {
         NSCursor.setHiddenUntilMouseMoves(false)
+        chrome(true, 0.12)
         if controls.alphaValue == 0, target == nil, let b = backend { controls.setTime(b.currentSeconds, playing: b.isPlaying) }
         if controlsHiddenByUser { setWindowButtons(visible: true, duration: 0.12); scheduleHide(); return }
         if controls.alphaValue < 1 {
@@ -1038,8 +1062,9 @@ final class PlayerView: NSView {
         if NSWorkspace.shared.isVoiceOverEnabled { hideWork?.cancel(); return }   // HIG: avoid time-boxed UI for assistive tech
         hideWork?.cancel()
         let w = DispatchWorkItem { [weak self] in
-            guard let self, !self.dragging, !self.controls.isMouseInside, !self.overWindowButtons else { return }
+            guard let self, !self.dragging, !self.controls.isMouseInside, !self.overWindowButtons, !self.pointerOverOverlay() else { return }
             NSAnimationContext.runAnimationGroup { $0.duration = 0.25; self.controls.animator().alphaValue = 0 }
+            if self.isPlayingNow { self.chrome(false, 0.25) }   // paused: the list and info stay up
             self.previewBubble.show(false)
             self.setWindowButtons(visible: false, duration: 0.25)
             if self.window?.isKeyWindow == true { NSCursor.setHiddenUntilMouseMoves(true) }
@@ -1063,6 +1088,7 @@ final class PlayerView: NSView {
     private func setInfo(_ on: Bool) {
         infoPanel.isHidden = !on
         onInfoToggled?(on)
+        if on { showControls() }                       // up with the controls, fading with them while playing
         guard on, infoTask == nil, let url = loadedURL else { return }
         infoTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -1072,6 +1098,9 @@ final class PlayerView: NSView {
             self.needsLayout = true
         }
     }
+
+    /// Bring the controls and overlays up (then they fade again if playing).
+    func reveal() { showControls() }
 
     /// A short message in the middle of the picture (the playlist's "3 of 12: name" when it's hidden).
     func announce(_ text: String) { flash(status, text) }

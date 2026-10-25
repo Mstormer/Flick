@@ -45,7 +45,7 @@ enum MainMenu {
         item(view, "Enter Full Screen", #selector(NSWindow.toggleFullScreen(_:)), "f", [.control, .command])
         view.addItem(.separator())
         item(view, "Hide Controls", #selector(PlayerView.toggleControllerVisibility(_:)), "", [])
-        item(view, "Show Playlist", #selector(PlayerView.togglePlaylist(_:)), "l", [])
+        item(view, "Show Playlist", #selector(PlayerView.togglePlaylist(_:)), "\\", [])
         item(view, "Show Info", #selector(PlayerView.toggleInfo(_:)), "i", [])
         let subsItem = view.addItem(withTitle: "Subtitles", action: nil, keyEquivalent: "")
         let subs = NSMenu(title: "Subtitles")
@@ -75,7 +75,7 @@ enum MainMenu {
         speedItem.submenu = speed
         item(speed, "Faster", #selector(PlayerView.faster), "]", [])
         item(speed, "Slower", #selector(PlayerView.slower), "[", [])
-        item(speed, "Normal Speed", #selector(PlayerView.normalSpeed), "\\", [])
+        item(speed, "Normal Speed", #selector(PlayerView.normalSpeed), "\u{7f}", [])
         speed.addItem(.separator())
         for r in 1...4 { item(speed, "\(r)×", #selector(PlayerView.setSpeedFromMenu(_:)), "\(r)", []).tag = r }
         pb.addItem(.separator())
@@ -109,17 +109,22 @@ enum MainMenu {
         return main
     }
 
-    /// A window with a playlist gives ↑/↓ to Previous/Next Video and moves volume to ⌥↑/⌥↓; a single
-    /// video keeps ↑/↓ for volume. Set whenever a player window becomes key, so the menu shows the live keys.
-    static func setPlaylistMode(_ on: Bool) {
+    /// With the playlist showing, ↑/↓ are Previous/Next Video and volume is ⌥↑/⌥↓; with it hidden it's the
+    /// other way round; a single video has ↑/↓ for volume only. Set whenever this changes or a player window
+    /// becomes key, so the menu always shows the live keys.
+    static func setPlaylistMode(_ playlist: Bool, visible: Bool) {
         guard let pb = NSApp.mainMenu?.items.first(where: { $0.submenu?.title == "Playback" })?.submenu else { return }
         let up = key(NSUpArrowFunctionKey), down = key(NSDownArrowFunctionKey)
-        pb.item(withTag: previousVideoTag)?.keyEquivalent = on ? up : ""
-        pb.item(withTag: nextVideoTag)?.keyEquivalent = on ? down : ""
+        let switchMods: NSEvent.ModifierFlags = visible ? [] : [.option]
+        for (tag, k) in [(previousVideoTag, up), (nextVideoTag, down)] {
+            guard let i = pb.item(withTag: tag) else { continue }
+            i.keyEquivalent = playlist ? k : ""
+            i.keyEquivalentModifierMask = switchMods
+        }
         for (tag, k) in [(volumeUpTag, up), (volumeDownTag, down)] {
             guard let i = pb.item(withTag: tag) else { continue }
             i.keyEquivalent = k
-            i.keyEquivalentModifierMask = on ? [.option] : []
+            i.keyEquivalentModifierMask = playlist && visible ? [.option] : []
         }
     }
 
@@ -268,7 +273,7 @@ final class HelpWindow: NSWindowController {
         text.append(NSAttributedString(string: "Playlist\n", attributes: k))
         text.append(NSAttributedString(string: "\nPlaylists\n", attributes: h))
         text.append(NSAttributedString(string: "Open or drop several videos, or a folder (searched with its subfolders), to play them in one window. "
-            + "↑ and ↓ move through the list and ⌥↑ ⌥↓ set the volume; L shows or hides the list; the next video starts when one ends. While paused, switching shows only the name until you press Play.\n", attributes: b))
+            + "\\ shows or hides the list. While it shows, ↑ and ↓ move through it and ⌥↑ ⌥↓ set the volume; while it's hidden, ↑ ↓ are volume and ⌥↑ ⌥↓ switch videos. While playing, the list fades with the controls. The next video starts when one ends. While paused, switching shows only the name until you press Play.\n", attributes: b))
 
         text.append(NSAttributedString(string: "\nOpen-Source Software\n", attributes: h))
         text.append(NSAttributedString(string: "WMV, VC-1, WMA, DTS, TrueHD, Vorbis and some VP9 files are decoded with libavformat, "

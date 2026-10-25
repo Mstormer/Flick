@@ -53,18 +53,23 @@ struct MediaInfo {
             if let r = try? await t.load(.estimatedDataRate), r > 0 { rows.append(("Bitrate", rate(Double(r)))) }
             info.sections.append(Section(title: "Video", rows: rows))
         }
-        for t in (try? await a.loadTracks(withMediaType: .audio)) ?? [] {
+        let audios = (try? await a.loadTracks(withMediaType: .audio)) ?? []
+        for t in audios {
             guard let f = try? await t.load(.formatDescriptions).first else { continue }
             var rows = [("Codec", audioCodec(f))]
             if let d = CMAudioFormatDescriptionGetStreamBasicDescription(f)?.pointee {
-                rows.append(("Channels", channels(Int(d.mChannelsPerFrame))))
+                rows.append(("Channels", layoutName(f) ?? channels(Int(d.mChannelsPerFrame))))
                 rows.append(("Sample rate", hz(d.mSampleRate)))
                 if d.mFormatID == kAudioFormatLinearPCM, d.mBitsPerChannel > 0 { rows.append(("Bit depth", "\(d.mBitsPerChannel)-bit")) }
+                if [kAudioFormatAppleLossless, kAudioFormatFLAC].contains(d.mFormatID), let b = [1: 16, 2: 20, 3: 24, 4: 32][Int(d.mFormatFlags)] {
+                    rows.append(("Bit depth", "\(b)-bit"))
+                }
             }
             if let r = try? await t.load(.estimatedDataRate), r > 0 { rows.append(("Bitrate", rate(Double(r)))) }
             var lang = try? await t.load(.extendedLanguageTag)
             if lang == nil { lang = try? await t.load(.languageCode) }
             if let l = lang ?? nil, let name = language(l) { rows.append(("Language", name)) }
+            if audios.count > 1 { rows.append(("Playing", (try? await t.load(.isEnabled)) == true ? "Yes" : "No")) }
             info.sections.append(Section(title: "Audio", rows: rows))
         }
         let subs = (try? await a.loadMediaSelectionGroup(for: .legible))?.options.map(\.displayName) ?? []
@@ -124,7 +129,10 @@ struct MediaInfo {
     static func audioCodec(_ f: CMFormatDescription) -> String {
         let id = CMFormatDescriptionGetMediaSubType(f)
         switch id {
-        case kAudioFormatMPEG4AAC: return "AAC"
+        case kAudioFormatMPEG4AAC:
+            var size = 0
+            guard let p = CMAudioFormatDescriptionGetMagicCookie(f, sizeOut: &size), size > 0 else { return "AAC" }
+            return aac(Data(bytes: p, count: size))
         case kAudioFormatMPEG4AAC_HE: return "HE-AAC"
         case kAudioFormatMPEG4AAC_HE_V2: return "HE-AAC v2"
         case kAudioFormatMPEG4AAC_LD, kAudioFormatMPEG4AAC_ELD: return "AAC (low delay)"
@@ -139,6 +147,46 @@ struct MediaInfo {
         case kAudioFormatAppleIMA4: return "IMA 4:1"
         default: return fourCC(id)
         }
+    }
+
+    /// The AAC profile from an AudioSpecificConfig (first 5 bits), found inside an MPEG-4 ES descriptor
+    /// (MP4 'esds' cookie: the DecoderSpecificInfo, tag 5) or given bare (Matroska CodecPrivate).
+    static func aac(_ d: Data) -> String {
+        let b = [UInt8](d)
+        var i = 0
+        func length() -> Int {                              // descriptor size: 7 bits per byte, high bit = more
+            var n = 0
+            while i < b.count { let x = b[i]; i += 1; n = n << 7 | Int(x & 0x7F); if x & 0x80 == 0 { break } }
+            return n
+        }
+        var asc = 0
+        if b.first == 0x03 {                                // ES_Descriptor → DecoderConfigDescriptor → DecoderSpecificInfo
+            i = 1; _ = length()
+            guard i + 3 <= b.count else { return "AAC" }
+            let flags = b[i + 2]; i += 3
+            if flags & 0x80 != 0 { i += 2 }
+            if flags & 0x40 != 0, i < b.count { i += 1 + Int(b[i]) }
+            if flags & 0x20 != 0 { i += 2 }
+            guard i < b.count, b[i] == 0x04 else { return "AAC" }
+            i += 1; _ = length(); i += 13
+            guard i < b.count, b[i] == 0x05 else { return "AAC" }
+            i += 1; _ = length()
+            asc = i
+        }
+        guard asc < b.count else { return "AAC" }
+        let names = [1: "AAC Main", 2: "AAC-LC", 3: "AAC SSR", 4: "AAC LTP", 5: "HE-AAC", 23: "AAC-LD", 29: "HE-AAC v2", 39: "AAC-ELD"]
+        return names[Int(b[asc] >> 3)] ?? "AAC"
+    }
+
+    /// The channel layout's own name ("5.1 (L R C LFE Ls Rs)"), when the file declares one.
+    private static func layoutName(_ f: CMAudioFormatDescription) -> String? {
+        var size = 0
+        guard let l = CMAudioFormatDescriptionGetChannelLayout(f, sizeOut: &size), size > 0 else { return nil }
+        var name: Unmanaged<CFString>?
+        var n = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        guard AudioFormatGetProperty(kAudioFormatProperty_ChannelLayoutName, UInt32(size), l, &n, &name) == noErr,
+              let s = name?.takeRetainedValue() as String?, !s.isEmpty else { return nil }
+        return s
     }
 
     /// Bit depth and HDR from the format description's colour tags.
@@ -162,6 +210,10 @@ struct MediaInfo {
             guard d > 0, let p = m.packets[t.number], !p.isEmpty else { return nil }
             return rate(Double(p.reduce(0) { $0 + Int($1.size) }) * 8 / d)
         }
+        // the track NativePlayback plays: the default one if anything decodes it, else the first that decodes
+        let audio = m.audioTracks
+        let decodes = { (t: MKVFile.Track) in MKVCodecs.audioFormat(t) != nil || MKVCodecs.ffAudioCodec(t) != nil }
+        let playing = (audio.filter(\.isDefault) + audio).first(where: decodes)?.number
         for t in m.tracks {
             var rows: [(String, String)] = []
             switch t.type {
@@ -184,7 +236,7 @@ struct MediaInfo {
                 if let b = bitrate(t) { rows.append(("Bitrate", b)) }
                 info.sections.append(Section(title: "Video", rows: rows))
             case 2:
-                rows.append(("Codec", mkvCodec(t.codecID)))
+                rows.append(("Codec", t.codecID.hasPrefix("A_AAC") && t.codecPrivate?.isEmpty == false ? aac(t.codecPrivate!) : mkvCodec(t.codecID)))
                 rows.append(("Channels", channels(t.channels)))
                 rows.append(("Sample rate", hz(t.sampleRate)))
                 // bit depth means something only for lossless audio
@@ -192,7 +244,9 @@ struct MediaInfo {
                     rows.append(("Bit depth", "\(t.bitDepth)-bit"))
                 }
                 if let b = bitrate(t) { rows.append(("Bitrate", b)) }
+                rows.append(("Decoder", MKVCodecs.audioFormat(t) != nil ? "macOS" : MKVCodecs.ffAudioCodec(t) != nil ? "FFmpeg" : "Not supported"))
                 rows += trackLabels(t)
+                if audio.count > 1 { rows.append(("Playing", t.number == playing ? "Yes" : "No")) }
                 info.sections.append(Section(title: "Audio", rows: rows))
             case 17:
                 rows.append(("Format", mkvCodec(t.codecID)))
@@ -291,8 +345,14 @@ struct MediaInfo {
                 if p.bit_rate > 0 { rows.append(("Bitrate", rate(Double(p.bit_rate)))) }
                 info.sections.append(Section(title: "Video", rows: rows))
             case AVMEDIA_TYPE_AUDIO:
-                rows.append(("Channels", channels(Int(p.ch_layout.nb_channels))))
+                var layout = p.ch_layout
+                var buf = [CChar](repeating: 0, count: 64)
+                let described = av_channel_layout_describe(&layout, &buf, buf.count) > 0 && layout.order == AV_CHANNEL_ORDER_NATIVE
+                let n = Int(p.ch_layout.nb_channels)
+                let name = String(cString: buf)
+                rows.append(("Channels", described && n > 2 && name != channels(n) ? "\(channels(n)) (\(name))" : channels(n)))
                 rows.append(("Sample rate", hz(Double(p.sample_rate))))
+                if p.bits_per_raw_sample > 0 { rows.append(("Bit depth", "\(p.bits_per_raw_sample)-bit")) }
                 if p.bit_rate > 0 { rows.append(("Bitrate", rate(Double(p.bit_rate)))) }
                 info.sections.append(Section(title: "Audio", rows: rows))
             case AVMEDIA_TYPE_SUBTITLE:
