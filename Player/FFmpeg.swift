@@ -703,9 +703,11 @@ final class FFPlayback: Playback {
             lastEnd = max(lastEnd, pts + dur)
             enqueue(px, pts, dur, g)
         }
-        if sync.rate > 0 && !pumpPending && !ended {
+        // playing, not only while the clock runs: after Play the clock starts once the sound is heard
+        // (a quarter second later), and a pump that waited for it would never come back
+        if (sync.rate > 0 || isPlaying) && !pumpPending && !ended {
             pumpPending = true
-            let wait = Double(max(1, lead / 2)) * frameDuration / Double(sync.rate)
+            let wait = Double(max(1, lead / 2)) * frameDuration / Double(max(sync.rate, rate, 0.25))
             q.asyncAfter(deadline: .now() + wait) { [weak self] in self?.pump(g, timer: true) }
         }
     }

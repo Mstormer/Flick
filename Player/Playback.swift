@@ -517,9 +517,10 @@ final class NativePlayback: Playback {
         }
         if vNext >= index.samples.count { VTDecompressionSessionFinishDelayedFrames(s) }
         // playing: come back once about half the queue has been shown
-        if sync.rate > 0 && !pumpPending && vNext < index.samples.count {
+        // playing, not only while the clock runs (it starts once the sound is heard, see FFPlayback.pump)
+        if (sync.rate > 0 || isPlaying) && !pumpPending && vNext < index.samples.count {
             pumpPending = true
-            let wait = Double(max(1, lead / 2)) / fps / Double(sync.rate)
+            let wait = Double(max(1, lead / 2)) / fps / Double(max(sync.rate, rate, 0.25))
             q.asyncAfter(deadline: .now() + wait) { [weak self] in self?.pump(g, timer: true) }
         }
     }
