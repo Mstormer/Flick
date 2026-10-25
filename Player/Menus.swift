@@ -86,6 +86,8 @@ enum MainMenu {
         item(pb, "Volume Down", #selector(PlayerView.volumeDown(_:)), key(NSDownArrowFunctionKey), []).tag = volumeDownTag
         item(pb, "Mute", #selector(PlayerView.toggleMute(_:)), "m", [])
         pb.addItem(.separator())
+        pb.addItem(withTitle: "Clear Playback Cache", action: #selector(AppDelegate.clearPlaybackCache(_:)), keyEquivalent: "").target = app
+        pb.addItem(.separator())
         let custom = pb.addItem(withTitle: "Your Shortcuts", action: nil, keyEquivalent: "")
         custom.isEnabled = false
         custom.tag = shortcutsTag - 1
@@ -269,6 +271,8 @@ final class HelpWindow: NSWindowController {
         text.append(NSAttributedString(string: "Volume\n", attributes: k))
         text.append(NSAttributedString(string: "Double-click the video\t", attributes: b))
         text.append(NSAttributedString(string: "Full screen\n", attributes: k))
+        text.append(NSAttributedString(string: "Pinch in or spread out\t", attributes: b))
+        text.append(NSAttributedString(string: "Window size\n", attributes: k))
         text.append(NSAttributedString(string: "Drop files or a folder on the window\t", attributes: b))
         text.append(NSAttributedString(string: "Playlist\n", attributes: k))
         text.append(NSAttributedString(string: "\nPlaylists\n", attributes: h))

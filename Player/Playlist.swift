@@ -38,7 +38,7 @@ final class PlaylistPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     private let effect = NSVisualEffectView()
     private let header = NSTextField(labelWithString: "")
     private let scroll = NSScrollView()
-    private let table = NSTableView()
+    private let table = PlaylistTable()
     private var items: [URL] = []
     private var durations: [URL: Double] = [:]
     private var loading: Task<Void, Never>?
@@ -75,8 +75,7 @@ final class PlaylistPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         table.refusesFirstResponder = true
         table.dataSource = self
         table.delegate = self
-        table.target = self
-        table.action = #selector(clicked)
+        table.onClick = { [weak self] r in self?.clicked(r) }
         table.setAccessibilityLabel("Playlist")
         scroll.documentView = table
         scroll.drawsBackground = false
@@ -121,10 +120,9 @@ final class PlaylistPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         }
     }
 
-    @objc private func clicked() {
-        let r = table.clickedRow
-        guard r >= 0, r != current else { if r >= 0 { select(r) }; return }
-        onPick?(r)
+    private func clicked(_ r: Int) {
+        guard r >= 0 else { return }
+        if r == current { select(r) } else { onPick?(r) }
     }
 
     func numberOfRows(in t: NSTableView) -> Int { items.count }
@@ -146,6 +144,15 @@ final class PlaylistPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         scroll.frame = NSRect(x: 6, y: 6, width: bounds.width - 12, height: bounds.height - 36)
         table.tableColumns.first?.width = scroll.contentSize.width
     }
+}
+
+/// Rows play on a single click, also in a window that isn't frontmost, and the table never takes the
+/// keyboard (the arrows belong to the player).
+final class PlaylistTable: NSTableView {
+    var onClick: ((Int) -> Void)?
+    override var acceptsFirstResponder: Bool { false }
+    override func acceptsFirstMouse(for e: NSEvent?) -> Bool { true }
+    override func mouseDown(with e: NSEvent) { onClick?(row(at: convert(e.locationInWindow, from: nil))) }
 }
 
 /// One row: the file name (middle-truncated, so episode numbers at the end stay visible) and its length.
@@ -172,4 +179,41 @@ final class PlaylistRow: NSTableCellView {
         time.frame = NSRect(x: bounds.width - tw - 8, y: (bounds.height - 15) / 2, width: tw, height: 15)
         name.frame = NSRect(x: 8, y: (bounds.height - 16) / 2, width: bounds.width - tw - 20, height: 16)
     }
+}
+
+/// Where each video was left, so it opens there again. Keyed by path and size (a replaced file starts
+/// over); the oldest entries go past 2,000. Playback › Clear Playback Cache forgets them all.
+enum PlaybackMemory {
+    private static let key = "positions"
+    private static let limit = 2000
+
+    private static func id(_ url: URL) -> String {
+        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        return url.standardizedFileURL.path + "|\(size)"
+    }
+
+    private static var all: [String: [Double]] {
+        get { UserDefaults.standard.dictionary(forKey: key) as? [String: [Double]] ?? [:] }
+        set { UserDefaults.standard.set(newValue, forKey: key) }
+    }
+
+    /// A place worth going back to: past the first few seconds and not at the very end.
+    static func position(for url: URL, duration: Double) -> Double? {
+        guard let t = all[id(url)]?.first, t > 3, duration <= 0 || t < duration - 5 else { return nil }
+        return t
+    }
+
+    static func save(_ url: URL, at t: Double, duration: Double) {
+        var d = all
+        let k = id(url)
+        if t <= 3 || (duration > 0 && t >= duration - 5) { d[k] = nil }       // finished, or barely started
+        else { d[k] = [t, Date().timeIntervalSince1970] }
+        if d.count > limit {
+            for (k, _) in d.sorted(by: { ($0.value.last ?? 0) < ($1.value.last ?? 0) }).prefix(d.count - limit) { d[k] = nil }
+        }
+        all = d
+    }
+
+    static func forget(_ url: URL) { var d = all; d[id(url)] = nil; all = d }
+    static func clear() { UserDefaults.standard.removeObject(forKey: key) }
 }

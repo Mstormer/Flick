@@ -569,7 +569,7 @@ final class FFPlayback: Playback {
         duration = v.demux.duration
         displaySize = v.displaySize
         display.videoGravity = .resizeAspect
-        audio.audioTimePitchAlgorithm = .spectral
+        audio.audioTimePitchAlgorithm = .timeDomain
         sync.addRenderer(display.sampleBufferRenderer)
         if audioSource != nil { sync.addRenderer(audio) }
         sync.delaysRateChangeUntilHasSufficientMediaData = false

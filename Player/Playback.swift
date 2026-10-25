@@ -38,7 +38,7 @@ final class AVPlayerPlayback: Playback {
     init(asset: AVURLAsset) {
         self.asset = asset
         let item = AVPlayerItem(asset: asset)
-        item.audioTimePitchAlgorithm = .spectral
+        item.audioTimePitchAlgorithm = .timeDomain
         player.replaceCurrentItem(with: item)
         player.actionAtItemEnd = .pause
         playerLayer.player = player
@@ -60,7 +60,7 @@ final class AVPlayerPlayback: Playback {
     private func revive() {
         guard isSuspended else { return }
         let item = AVPlayerItem(asset: asset)
-        item.audioTimePitchAlgorithm = .spectral
+        item.audioTimePitchAlgorithm = .timeDomain
         if let g = legibleGroup { item.select(savedLegible, in: g) }
         player.replaceCurrentItem(with: item)
         isSuspended = false
@@ -106,7 +106,8 @@ final class AVPlayerPlayback: Playback {
 
 /// Compressed video and audio straight from the MKV packet table into Apple's sample-buffer renderers,
 /// both slaved to one render synchronizer. Speed changes are a synchronizer rate change; the audio
-/// renderer time-stretches with pitch correction.
+/// renderer time-stretches with pitch correction (time-domain: 'spectral' re-renders on every change,
+/// stalling the clock ~60 ms).
 /// Audio for NativePlayback, from wherever the file keeps it. Used on the player's feed queue only.
 protocol AudioSource: AnyObject {
     var format: CMAudioFormatDescription { get }
@@ -267,7 +268,7 @@ final class NativePlayback: Playback {
         grid = cfr ? (first, step) : nil
         fps = cfr ? Double(index.timescale) / step : 1 / max(index.frameDuration, 0.001)
         display.videoGravity = .resizeAspect
-        audio.audioTimePitchAlgorithm = .spectral
+        audio.audioTimePitchAlgorithm = .timeDomain
         sync.addRenderer(display.sampleBufferRenderer)
         if audioSource != nil { sync.addRenderer(audio) }
         sync.delaysRateChangeUntilHasSufficientMediaData = false

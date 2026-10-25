@@ -46,6 +46,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return FileManager.default.fileExists(atPath: u.path, isDirectory: &d) && d.boolValue
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
+    func applicationWillTerminate(_ n: Notification) { windows.forEach { $0.view.savePosition() } }
+
+    @objc func clearPlaybackCache(_ s: Any?) { PlaybackMemory.clear() }
 
     func open(_ url: URL) {
         if isFolder(url) { open([url]); return }
@@ -276,6 +279,8 @@ final class PlayerView: NSView {
     var pointerOverOverlay: () -> Bool = { false }
     /// Carried over from the previous video in the list.
     var startSound: (volume: Float, muted: Bool)?
+    /// Test harnesses set this so nothing they open is heard (the audio still runs, just silent).
+    static var startMuted = false
     var startInfo = false
     var soundState: (volume: Float, muted: Bool)? { backend.map { ($0.volume, $0.isMuted) } ?? startSound }
     /// Playing, or about to (still opening, or mid-seek with play to resume).
@@ -396,7 +401,7 @@ final class PlayerView: NSView {
                 playAsset = asset
                 if let (native, idx) = await NativePlayback.make(asset: asset) {
                     // decodes only a few frames ahead: about 100 MB less than AVPlayer for 4K
-                    native.onEnd = { [weak self] in self?.controls.setTime(self?.duration ?? 0, playing: false); self?.onFinished?() }
+                    native.onEnd = { [weak self] in self?.controls.setTime(self?.duration ?? 0, playing: false); self?.finished() }
                     backend = native
                     newIndex = idx
                     duration = idx.duration
@@ -406,7 +411,7 @@ final class PlayerView: NSView {
                     duration = (try? await asset.load(.duration).seconds) ?? 0
                     endObserver = NotificationCenter.default.addObserver(forName: AVPlayerItem.didPlayToEndTimeNotification, object: nil, queue: .main) { [weak self, weak av] n in
                         guard let av, (n.object as? AVPlayerItem) === av.player.currentItem else { return }
-                        self?.onFinished?()
+                        self?.finished()
                     }
                 }
                 size = (try? await asset.loadTracks(withMediaType: .video).first?.load(.naturalSize)) ?? .zero
@@ -417,7 +422,7 @@ final class PlayerView: NSView {
                           return (m, i)
                       }).value, let idx {
                 let native = NativePlayback(mkv: mkv, index: idx)
-                native.onEnd = { [weak self] in self?.controls.setTime(self?.duration ?? 0, playing: false); self?.onFinished?() }
+                native.onEnd = { [weak self] in self?.controls.setTime(self?.duration ?? 0, playing: false); self?.finished() }
                 backend = native
                 newIndex = idx
                 self.mkv = mkv
@@ -430,7 +435,7 @@ final class PlayerView: NSView {
                 guard let (v, a) = await Task.detached(operation: { FFPlayback.open(url, audio: mkv.flatMap(MKVCodecs.audioSource)) }).value
                 else { flash(status, "Can't open this file"); return }
                 let ff = FFPlayback(video: v, audio: a)
-                ff.onEnd = { [weak self] in self?.controls.setTime(self?.duration ?? 0, playing: false); self?.onFinished?() }
+                ff.onEnd = { [weak self] in self?.controls.setTime(self?.duration ?? 0, playing: false); self?.finished() }
                 backend = ff
                 self.mkv = mkv
                 duration = ff.duration
@@ -439,6 +444,7 @@ final class PlayerView: NSView {
             }
             guard let backend else { return }
             if let s = startSound { backend.volume = s.volume; backend.isMuted = s.muted }
+            if Self.startMuted { backend.isMuted = true }
             if startInfo || !infoPanel.isHidden {
                 infoTask?.cancel(); infoTask = nil         // read again, now that the decoder is known
                 setInfo(true)
@@ -462,7 +468,17 @@ final class PlayerView: NSView {
             tick()
             controls.setRate(rate)
             backend.setRate(rate)
-            backend.play(rate: rate)
+            if let t = PlaybackMemory.position(for: url, duration: duration) {
+                // where it was left last time
+                controls.setTime(t, playing: true)
+                flash(status, "Resuming at \(ControlBar.fmt(t))")
+                backend.seek(to: t) { [weak self, weak backend] _ in
+                    guard let self, let backend, self.backend === backend else { return }
+                    backend.play(rate: self.rate)
+                }
+            } else {
+                backend.play(rate: rate)
+            }
             showControls()
             // Build the frame index off the main thread; until it lands, seeks go straight to the backend.
             await loadCaptions(from: url, asset: playAsset)
@@ -485,6 +501,7 @@ final class PlayerView: NSView {
     /// UI clock. 30 Hz only while something on screen moves with it (visible controls, captions);
     /// otherwise 4 Hz, with timer tolerance so macOS can coalesce wakeups. Saves energy during playback.
     private func tick() {
+        if CACurrentMediaTime() - lastSaved > 5, backend?.isPlaying == true { savePosition() }
         if target == nil, let b = backend {
             let t = b.currentSeconds
             if controls.alphaValue > 0 { controls.setTime(t, playing: b.isPlaying) } else { controls.noteTime(t) }
@@ -498,7 +515,21 @@ final class PlayerView: NSView {
         clock = timer
     }
 
+    private func finished() {
+        if let u = loadedURL { PlaybackMemory.forget(u) }
+        onFinished?()
+    }
+
+    /// Remember where this video is (Playback › Clear Playback Cache forgets).
+    func savePosition() {
+        guard pendingURL == nil, let url = loadedURL, let b = backend, duration > 0 else { return }
+        lastSaved = CACurrentMediaTime()
+        PlaybackMemory.save(url, at: currentFrame.flatMap { index?.seconds($0) } ?? b.currentSeconds, duration: duration)
+    }
+    private var lastSaved = 0.0
+
     func teardown() {
+        savePosition()
         infoTask?.cancel()
         if let o = endObserver { NotificationCenter.default.removeObserver(o) }
         engine?.stop()
@@ -712,7 +743,7 @@ final class PlayerView: NSView {
             backend?.play(rate: rate)
         }
         controls.setTime(controls.time, playing: target != nil ? resumeAfterSeek : backend?.isPlaying ?? false)
-        if isPlayingNow { scheduleHide() } else { chrome(true, 0.12) }
+        if isPlayingNow { scheduleHide() } else { chrome(true, 0.12); savePosition() }
     }
 
     private func setRate(_ r: Float) {
@@ -973,6 +1004,15 @@ final class PlayerView: NSView {
         }
     }
 
+    /// The arrow keys are the player's: take them before the menu bar, so a menu item can never swallow
+    /// them (Previous/Next Video and Volume share them, depending on whether the playlist shows).
+    override func performKeyEquivalent(with e: NSEvent) -> Bool {
+        guard window?.firstResponder === self, (123...126).contains(e.keyCode),
+              e.modifierFlags.intersection([.command, .control]).isEmpty else { return super.performKeyEquivalent(with: e) }
+        keyDown(with: e)
+        return true
+    }
+
     override func keyDown(with e: NSEvent) {
         if let sc = Shortcuts.shared.match(e) { perform(sc); return }
         let shift = e.modifierFlags.contains(.shift)
@@ -1017,6 +1057,24 @@ final class PlayerView: NSView {
         guard e.momentumPhase.isEmpty, e.scrollingDeltaY != 0 else { return }
         let up = Float(e.isDirectionInvertedFromDevice ? -e.scrollingDeltaY : e.scrollingDeltaY)
         changeVolume(e.hasPreciseScrollingDeltas ? up * 0.003 : (up > 0 ? 0.05 : -0.05))
+    }
+
+    /// Pinch in / spread out: the window shrinks or grows around its centre, keeping the video's shape,
+    /// from 320 pt wide up to the full width (or height) of the screen.
+    override func magnify(with e: NSEvent) { zoomWindow(by: e.magnification) }
+
+    func zoomWindow(by m: CGFloat) {
+        guard let w = window, !w.styleMask.contains(.fullScreen), let screen = w.screen?.visibleFrame, m != 0 else { return }
+        let f = w.frame
+        let aspect = f.width / max(1, f.height)
+        var width = min(max(f.width * (1 + m), 320), screen.width)
+        var height = width / aspect
+        if height > screen.height { height = screen.height; width = height * aspect }
+        width = width.rounded(); height = height.rounded()
+        var r = NSRect(x: (f.midX - width / 2).rounded(), y: (f.midY - height / 2).rounded(), width: width, height: height)
+        r.origin.x = min(max(r.minX, screen.minX), screen.maxX - r.width)
+        r.origin.y = min(max(r.minY, screen.minY), screen.maxY - r.height)
+        w.setFrame(r, display: true)
     }
 
     override func mouseMoved(with e: NSEvent) { showControls() }
