@@ -416,8 +416,10 @@ final class PlayerView: NSView {
                 }
                 size = (try? await asset.loadTracks(withMediaType: .video).first?.load(.naturalSize)) ?? .zero
             } else if let (mkv, idx) = await Task.detached(operation: { () -> (MKVFile, MediaIndex?)? in
-                          // Matroska natively: parse, index, and play without a demuxer library
-                          guard let m = MKVFile(url: url), m.video != nil else { return nil }
+                          // Matroska natively: parse, index, and play without a demuxer library. The header first:
+                          // video only FFmpeg decodes (MPEG-2, VC-1…) skips the full index.
+                          guard let h = MKVFile(url: url, headerOnly: true), let hv = h.video, MKVCodecs.mayPlayNatively(hv),
+                                let m = MKVFile(url: url), m.video != nil else { return nil }
                           guard let i = MediaIndex(mkv: m), ScrubEngine.canDecode(i) else { return (m, nil) }
                           return (m, i)
                       }).value, let idx {
@@ -432,8 +434,15 @@ final class PlayerView: NSView {
                 size = CGSize(width: v.displayWidth > 0 ? v.displayWidth : v.width, height: v.displayHeight > 0 ? v.displayHeight : v.height)
             } else {
                 // WMV, VC-1, VP9 the hardware decoder refuses…: decoded in software by the bundled FFmpeg
-                let mkv = MKVFile(url: url)
-                guard let (v, a) = await Task.detached(operation: { FFPlayback.open(url, audio: mkv.flatMap(MKVCodecs.audioSource)) }).value
+                guard let (mkv, v, a) = await Task.detached(operation: { () -> (MKVFile?, FFVideo, AudioSource?)? in
+                          // Matroska: when FFmpeg decodes all of it, it reads the file as it plays (instant, even on a
+                          // network share); otherwise the packet table is read for the system's audio decoders.
+                          let head = MKVFile(url: url, headerOnly: true)
+                          let lazy = head.map(MKVCodecs.ffmpegReadsAll) ?? true
+                          let mkv = lazy ? head : MKVFile(url: url)
+                          guard let (v, a) = FFPlayback.open(url, audio: lazy ? nil : mkv.flatMap(MKVCodecs.audioSource)) else { return nil }
+                          return (mkv, v, a)
+                      }).value
                 else { flash(status, "Can't open this file"); return }
                 mkv?.dropPlaybackPackets()
                 let ff = FFPlayback(video: v, audio: a)

@@ -244,7 +244,9 @@ struct MediaInfo {
                     rows.append(("Bit depth", "\(t.bitDepth)-bit"))
                 }
                 if let b = bitrate(t) { rows.append(("Bitrate", b)) }
-                rows.append(("Decoder", MKVCodecs.audioFormat(t) != nil ? "macOS" : MKVCodecs.ffAudioCodec(t) != nil ? "FFmpeg" : "Not supported"))
+                // read from the header alone, FFmpeg demuxes and decodes everything (see ffmpegReadsAll)
+                let ff = m.headerOnly && MKVCodecs.ffmpegReadsAll(m)
+                rows.append(("Decoder", !ff && MKVCodecs.audioFormat(t) != nil ? "macOS" : ff || MKVCodecs.ffAudioCodec(t) != nil ? "FFmpeg" : "Not supported"))
                 rows += trackLabels(t)
                 if audio.count > 1 { rows.append(("Playing", t.number == playing ? "Yes" : "No")) }
                 info.sections.append(Section(title: "Audio", rows: rows))

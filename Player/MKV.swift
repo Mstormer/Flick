@@ -43,10 +43,14 @@ final class MKVFile {
     private(set) var duration: Double = 0              // seconds
     let base: UnsafePointer<UInt8>
     let length: Int
+    let headerOnly: Bool
     private let raw: UnsafeMutableRawPointer
 
-    init?(url: URL) {
+    /// `headerOnly`: stop at the first cluster, so only the tracks and info are read (a few KB instead of
+    /// every block header, which on a network share means pulling most of the file across).
+    init?(url: URL, headerOnly: Bool = false) {
         self.url = url
+        self.headerOnly = headerOnly
         let fd = open(url.path, O_RDONLY)
         guard fd >= 0 else { return nil }
         defer { close(fd) }
@@ -168,6 +172,7 @@ final class MKVFile {
                 children(o, end) { cid, co, cn in if cid == 0xAE { self.parseTrack(co, co + cn) } }
                 o = end
             case 0x1F43B675: // Cluster
+                if headerOnly { return video != nil }
                 if sz < 0 {
                     o = parseCluster(o, segEnd, unknownSize: true)
                 } else {

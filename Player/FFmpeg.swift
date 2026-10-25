@@ -255,6 +255,18 @@ extension MKVCodecs {
         }
     }
 
+    /// Video the native player can take (hardware or VideoToolbox decoders); anything else goes to FFmpeg.
+    static func mayPlayNatively(_ t: MKVFile.Track) -> Bool {
+        ["V_MPEG4/ISO/AVC", "V_MPEGH/ISO/HEVC", "V_AV1", "V_VP9"].contains(t.codecID)
+    }
+
+    /// FFmpeg can read this file as it plays, with no packet table: every audio track has an FFmpeg decoder
+    /// here and there are no Matroska subtitles (those are read from the table).
+    static func ffmpegReadsAll(_ mkv: MKVFile) -> Bool {
+        !mkv.tracks.contains { $0.type == 17 }
+            && mkv.audioTracks.allSatisfy { $0.codecID.hasPrefix("A_PCM") || ffAudioCodec($0) != nil }
+    }
+
     /// The audio to play from a Matroska file: the default track if anything here decodes it, else the
     /// first track that decodes. The system's decoders first, FFmpeg's for the rest.
     static func audioSource(_ mkv: MKVFile) -> AudioSource? {

@@ -1,6 +1,6 @@
 #!/bin/zsh
 # Builds the trimmed FFmpeg libraries Flick bundles: only the decoders macOS lacks (WMV/VC-1, WMA,
-# VP9 fallback, DTS, TrueHD, Vorbis, ALAC in Matroska) and the ASF/Matroska demuxers. LGPL 2.1: no --enable-gpl,
+# VP9 fallback, MPEG-1/2 video, DTS, TrueHD, Vorbis, ALAC in Matroska) and the ASF/Matroska demuxers. LGPL 2.1: no --enable-gpl,
 # no --enable-version3, no --enable-nonfree. Shared libraries, so users can swap in their own build.
 # Output: Vendor/ffmpeg/{include,lib}. Source: the unmodified release tarball, kept in Vendor/src.
 set -e
@@ -22,8 +22,9 @@ cd ffmpeg-$VER
   --disable-everything --disable-avdevice --disable-avfilter --disable-swscale --disable-swresample \
   --enable-zlib \
   --enable-decoder=wmv1,wmv2,wmv3,vc1,msmpeg4v1,msmpeg4v2,msmpeg4v3,wmav1,wmav2,wmapro,wmalossless,wmavoice \
-  --enable-decoder=vp9,dca,truehd,mlp,vorbis,alac \
-  --enable-parser=vc1,vp9,dca,mlp \
+  --enable-decoder=vp9,dca,truehd,mlp,vorbis,alac,mpeg1video,mpeg2video \
+  --enable-decoder=pcm_s16le,pcm_s16be,pcm_s24le,pcm_s24be,pcm_s32le,pcm_s32be,pcm_f32le,pcm_f64le,pcm_u8 \
+  --enable-parser=vc1,vp9,dca,mlp,mpegvideo \
   --enable-demuxer=asf,matroska \
   --enable-protocol=file \
   --enable-bsf=vp9_superframe_split
