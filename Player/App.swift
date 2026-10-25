@@ -378,8 +378,8 @@ final class PlayerView: NSView {
         scrubLayer.frame = bounds
         CATransaction.commit()
         controls.frame = NSRect(x: 0, y: 0, width: bounds.width, height: 64)
-        hud.sizeToFit()
-        hud.frame = NSRect(x: bounds.midX - 50, y: bounds.maxY - 80, width: 100, height: 30)
+        let hw = hud.frame.width > 0 ? hud.frame.width : 100
+        hud.frame = NSRect(x: bounds.midX - hw / 2, y: bounds.maxY - 80, width: hw, height: 30)
         status.frame = NSRect(x: bounds.midX - 160, y: bounds.midY - 15, width: 320, height: 30)
         captionOverlay.frame = bounds
         let ih = infoPanel.fittingHeight
@@ -751,8 +751,12 @@ final class PlayerView: NSView {
         UserDefaults.standard.set(r, forKey: "rate")
         backend?.setRate(r)
         controls.setRate(r)
-        flash(hud, PlayerView.label(r))
+        flash(hud, PlayerView.label(r), width: speedBadgeWidth)
     }
+
+    /// The speed badge keeps one width, just wider than its longest label ("0.25×"), so it doesn't jump.
+    private lazy var speedBadgeWidth: CGFloat =
+        ceil(NSAttributedString(string: "0.00×", attributes: [.font: hud.font!]).size().width) + 14
 
     static func label(_ r: Float) -> String {
         r == r.rounded() ? String(format: "%.0f×", r) : String(format: "%g×", r)
@@ -1165,11 +1169,11 @@ final class PlayerView: NSView {
     /// A short message in the middle of the picture (the playlist's "3 of 12: name" when it's hidden).
     func announce(_ text: String) { flash(status, text) }
 
-    private func flash(_ f: NSTextField, _ text: String, hold: Bool = false) {
+    private func flash(_ f: NSTextField, _ text: String, hold: Bool = false, width: CGFloat? = nil) {
         f.stringValue = text
         NSAccessibility.post(element: self, notification: .announcementRequested,
                              userInfo: [.announcement: text, .priority: NSAccessibilityPriorityLevel.medium.rawValue])
-        let w = min(max(90, f.attributedStringValue.size().width + 28), bounds.width - 40)
+        let w = min(width ?? max(90, f.attributedStringValue.size().width + 28), bounds.width - 40)
         f.lineBreakMode = .byTruncatingMiddle
         f.frame.size.width = w
         f.frame.origin.x = bounds.midX - w / 2
