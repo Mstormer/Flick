@@ -266,9 +266,9 @@ final class HelpWindow: NSWindowController {
         }
         text.append(NSAttributedString(string: "\nGestures\n", attributes: h))
         text.append(NSAttributedString(string: "Swipe left or right with two fingers\t", attributes: b))
-        text.append(NSAttributedString(string: "Seek\n", attributes: k))
+        text.append(NSAttributedString(string: "Seek (right goes forward)\n", attributes: k))
         text.append(NSAttributedString(string: "Swipe up or down with two fingers\t", attributes: b))
-        text.append(NSAttributedString(string: "Volume\n", attributes: k))
+        text.append(NSAttributedString(string: "Volume (up is louder)\n", attributes: k))
         text.append(NSAttributedString(string: "Double-click the video\t", attributes: b))
         text.append(NSAttributedString(string: "Full screen\n", attributes: k))
         text.append(NSAttributedString(string: "Pinch in or spread out\t", attributes: b))

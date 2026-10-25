@@ -1049,8 +1049,10 @@ final class PlayerView: NSView {
     }
 
     override func scrollWheel(with e: NSEvent) {
+        // Two fingers right = forward, whatever the natural-scrolling setting.
         if abs(e.scrollingDeltaX) > abs(e.scrollingDeltaY) {
-            skip(-Double(e.scrollingDeltaX) * (e.hasPreciseScrollingDeltas ? 0.05 : 1))
+            let right = Double(e.isDirectionInvertedFromDevice ? e.scrollingDeltaX : -e.scrollingDeltaX)
+            skip(right * (e.hasPreciseScrollingDeltas ? 0.05 : 1))
             return
         }
         // Two fingers up = louder, whatever the natural-scrolling setting; ignore the momentum tail.
