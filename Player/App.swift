@@ -753,6 +753,7 @@ final class PlayerView: NSView {
         UserDefaults.standard.set(r, forKey: "rate")
         backend?.setRate(r)
         controls.setRate(r)
+        volumeBadge.hide()
         flash(hud, PlayerView.label(r), width: speedBadgeWidth)
     }
 
@@ -768,6 +769,7 @@ final class PlayerView: NSView {
         guard let b = backend else { return }
         b.volume = max(0, min(1, b.volume + by))
         if by != 0, b.isMuted { b.isMuted = false }
+        hud.alphaValue = 0
         volumeBadge.show(b.volume, muted: b.isMuted, in: bounds)
         controls.setVolume(b.volume, muted: b.isMuted)
     }
@@ -939,6 +941,7 @@ final class PlayerView: NSView {
     @objc func toggleMute(_ s: Any?) {
         guard let b = backend else { return }
         b.isMuted.toggle()
+        hud.alphaValue = 0
         volumeBadge.show(b.volume, muted: b.isMuted, in: bounds)
         controls.setVolume(b.volume, muted: b.isMuted)
     }
@@ -1422,9 +1425,10 @@ final class Scrubber: NSView {
     }
 }
 
-// MARK: - Volume badge (bottom right)
+// MARK: - Volume badge (top centre)
 
-/// Speaker glyph, percentage and a thin level bar, shown bottom-right while volume changes.
+/// Speaker glyph, percentage and a thin level bar, shown top centre (where the speed shows) while the
+/// volume changes, then fading as soon as it stops changing.
 final class VolumeBadge: NSView {
     private let icon = NSImageView()
     private let label = NSTextField(labelWithString: "")
@@ -1460,8 +1464,8 @@ final class VolumeBadge: NSView {
         icon.image = NSImage(systemSymbolName: name, accessibilityDescription: nil)
         label.stringValue = muted ? "Muted" : "\(pct)%"
         let w: CGFloat = 112, h: CGFloat = 34
-        // bottom right, clear of the control bar
-        frame = NSRect(x: host.maxX - w - 16, y: 72, width: w, height: h)
+        // top centre, on the same line as the speed badge (30 pt tall, its bottom 80 pt below the top)
+        frame = NSRect(x: (host.midX - w / 2).rounded(), y: host.maxY - 80 - (h - 30) / 2, width: w, height: h)
         icon.frame = NSRect(x: 10, y: 9, width: 22, height: 16)
         label.frame = NSRect(x: 34, y: 9, width: w - 44, height: 16)
         CATransaction.begin(); CATransaction.setDisableActions(true)
@@ -1473,9 +1477,12 @@ final class VolumeBadge: NSView {
                              userInfo: [.announcement: muted ? "Muted" : "Volume \(pct) percent", .priority: NSAccessibilityPriorityLevel.medium.rawValue])
         hideWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            NSAnimationContext.runAnimationGroup { $0.duration = 0.3; self?.animator().alphaValue = 0 }
+            NSAnimationContext.runAnimationGroup { $0.duration = 0.5; self?.animator().alphaValue = 0 }
         }
         hideWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
     }
+
+    /// Gone at once (the speed badge is taking the spot).
+    func hide() { hideWork?.cancel(); alphaValue = 0 }
 }
