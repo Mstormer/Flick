@@ -207,7 +207,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
 
     private func updateMenuKeys() { MainMenu.setPlaylistMode(items.count > 1, visible: !list.isHidden) }
     func windowDidBecomeKey(_ n: Notification) { updateMenuKeys() }
-    func windowWillClose(_ n: Notification) { view.teardown(); onClose?(); FreeMemory.giveBack(after: 1.5) }
+    func windowWillClose(_ n: Notification) { view.teardown(); onClose?() }
 }
 
 /// The window's content: the player, the playlist over its right side, and the drop target for files.
@@ -445,7 +445,6 @@ final class PlayerView: NSView {
                 previewSource = FFThumbnailer(url: url)
             }
             guard let backend else { return }
-            FreeMemory.giveBack(after: 0.5)            // indexing a long file leaves tens of MB of freed tables
             if let s = startSound { backend.volume = s.volume; backend.isMuted = s.muted }
             if Self.startMuted { backend.isMuted = true }
             if startInfo || !infoPanel.isHidden {
@@ -1208,14 +1207,6 @@ final class BadgeLabel: NSTextField {
             return t
         }
         override func drawInterior(withFrame f: NSRect, in v: NSView) { super.drawInterior(withFrame: titleRect(forBounds: f), in: v) }
-    }
-}
-
-/// macOS's allocator keeps freed blocks for reuse, and they still count against the app. After the big
-/// one-off allocations (indexing a file, closing a window) hand them back to the system.
-enum FreeMemory {
-    static func giveBack(after delay: Double) {
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { _ = malloc_zone_pressure_relief(nil, 0) }
     }
 }
 
