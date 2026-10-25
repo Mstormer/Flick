@@ -696,6 +696,22 @@ final class PlayerView: NSView {
         }
     }
 
+    /// A swipe in progress keeps its own target: each event moves on from where the last one aimed, not
+    /// from the picture on screen (which lags while seeks land, so a swipe used to lose most of its travel).
+    /// The controls stay up until it ends.
+    private var swipeTarget: (seconds: Double, at: CFTimeInterval)?
+
+    private func swipe(_ by: Double) {
+        guard pendingURL == nil, duration > 0 else { return }
+        let now = CACurrentMediaTime()
+        let from = swipeTarget.flatMap { now - $0.at < 0.4 ? $0.seconds : nil }
+            ?? currentFrame.flatMap { index?.seconds($0) } ?? backend?.currentSeconds ?? 0
+        let t = max(0, min(duration - 0.001, from + by))
+        swipeTarget = (t, now)
+        showControls()
+        seek(seconds: t, settleAfter: 0.25)
+    }
+
     private func skip(_ by: Double) {
         guard pendingURL == nil else { return }
         let base = currentFrame.flatMap { index?.seconds($0) } ?? backend?.currentSeconds ?? 0
@@ -1067,10 +1083,14 @@ final class PlayerView: NSView {
     }
 
     override func scrollWheel(with e: NSEvent) {
-        // Two fingers right = forward, whatever the natural-scrolling setting.
+        // Two fingers right = forward, whatever the natural-scrolling setting. Like dragging the playhead:
+        // about one and a half timeline widths of finger travel cross the whole video, within 0.05-0.5 s a
+        // point (fine moves in short clips, a few minutes a swipe in long films); a mouse's sideways wheel
+        // steps 5 s a notch.
         if abs(e.scrollingDeltaX) > abs(e.scrollingDeltaY) {
             let right = Double(e.isDirectionInvertedFromDevice ? e.scrollingDeltaX : -e.scrollingDeltaX)
-            skip(right * (e.hasPreciseScrollingDeltas ? 0.05 : 1))
+            let track = Double(max(200, controls.scrubber.frame.width))
+            swipe(right * (e.hasPreciseScrollingDeltas ? min(0.5, max(0.05, duration / (track * 1.5))) : 5))
             return
         }
         // Two fingers up = louder, whatever the natural-scrolling setting; ignore the momentum tail.
