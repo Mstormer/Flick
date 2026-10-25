@@ -249,7 +249,7 @@ final class PlayerView: NSView {
     private let videoHost = CALayer()          // the backend's own layer goes in here
     private let scrubLayer = AVSampleBufferDisplayLayer()
     private let controls = ControlBar()
-    private let hud = NSTextField(labelWithString: "")
+    private let hud = BadgeLabel()
     private let volumeBadge = VolumeBadge()
     private let previewBubble = PreviewBubble()
     private var previewSource: PreviewSource?
@@ -258,7 +258,7 @@ final class PlayerView: NSView {
     private(set) var captionSources: [CaptionSource] = []
     private(set) var captionChoice: Int?                 // index into captionSources; nil = off
     private var lastCaptionChoice = 0
-    private let status = NSTextField(labelWithString: "")
+    private let status = BadgeLabel()
     private let infoPanel = InfoPanel()
     private var infoTask: Task<Void, Never>?
     private var loadedURL: URL?
@@ -1180,6 +1180,27 @@ final class PlayerView: NSView {
             ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
             f.animator().alphaValue = 0
         })
+    }
+}
+
+/// A rounded message badge whose text sits in the middle of the box, vertically as well.
+final class BadgeLabel: NSTextField {
+    override class var cellClass: AnyClass? { get { CenteredCell.self } set {} }
+
+    convenience init() {
+        self.init(frame: .zero)
+        isEditable = false; isSelectable = false; isBordered = false; drawsBackground = false
+    }
+
+    final class CenteredCell: NSTextFieldCell {
+        override func titleRect(forBounds r: NSRect) -> NSRect {
+            var t = super.titleRect(forBounds: r)
+            let h = cellSize(forBounds: r).height
+            t.origin.y = r.minY + (r.height - h) / 2
+            t.size.height = h
+            return t
+        }
+        override func drawInterior(withFrame f: NSRect, in v: NSView) { super.drawInterior(withFrame: titleRect(forBounds: f), in: v) }
     }
 }
 
