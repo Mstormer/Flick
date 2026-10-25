@@ -135,17 +135,19 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         v.onTogglePlaylist = { [weak self] in self?.togglePlaylist() }
         v.onFinished = { [weak self] in
             guard let self, self.current + 1 < self.items.count else { return }
-            self.play(self.current + 1)
+            self.play(self.current + 1, autoplay: true)
         }
         v.onInfoToggled = { [weak self] on in self?.infoShown = on }
         window?.title = url.lastPathComponent
         window?.makeFirstResponder(v)
     }
 
-    /// Switch to another video in the list, keeping volume, mute and the info panel as they were.
-    func play(_ i: Int) {
+    /// Switch to another video in the list, keeping volume, mute and the info panel as they were. If the
+    /// player was paused it stays paused, and the new video isn't opened until Play.
+    func play(_ i: Int, autoplay: Bool? = nil) {
         guard items.indices.contains(i) else { return }
         let old = view
+        let playing = autoplay ?? old.isPlayingNow
         let sound = old.soundState
         old.teardown()
         old.removeFromSuperview()
@@ -155,9 +157,13 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         v.startInfo = infoShown
         view = v
         install(v)
-        v.load(url)
         list.select(i)
-        if list.isHidden { v.announce("\(i + 1) of \(items.count): \(url.deletingPathExtension().lastPathComponent)") }
+        if playing {
+            v.load(url)
+            if list.isHidden { v.announce("\(i + 1) of \(items.count): \(url.deletingPathExtension().lastPathComponent)") }
+        } else {
+            v.prepare(url)
+        }
     }
 
     private func step(_ by: Int) {
@@ -183,7 +189,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
         host.needsLayout = true
         MainMenu.setPlaylistMode(items.count > 1)
         current = 0
-        play(0)
+        play(0, autoplay: true)
     }
 
     func windowDidBecomeKey(_ n: Notification) { MainMenu.setPlaylistMode(items.count > 1) }
@@ -242,6 +248,9 @@ final class PlayerView: NSView {
     private let infoPanel = InfoPanel()
     private var infoTask: Task<Void, Never>?
     private var loadedURL: URL?
+    /// Chosen in the playlist while paused: shown as black with its name, opened only when Play is pressed,
+    /// so arrowing through a list doesn't open every file on the way.
+    private var pendingURL: URL?
     private var endObserver: NSObjectProtocol?
 
     // the window's playlist (PlayerWindowController owns it)
@@ -255,6 +264,23 @@ final class PlayerView: NSView {
     var startSound: (volume: Float, muted: Bool)?
     var startInfo = false
     var soundState: (volume: Float, muted: Bool)? { backend.map { ($0.volume, $0.isMuted) } ?? startSound }
+    /// Playing, or about to (still opening, or mid-seek with play to resume).
+    var isPlayingNow: Bool {
+        guard pendingURL == nil else { return false }
+        guard let backend else { return loadedURL != nil }
+        return target != nil ? resumeAfterSeek : backend.isPlaying
+    }
+
+    /// Stand in for `url` without opening it: black, its name, and the info panel if that's open.
+    func prepare(_ url: URL) {
+        pendingURL = url
+        loadedURL = url
+        controls.duration = 0
+        controls.setTime(0, playing: false)
+        showControls()
+        flash(status, url.deletingPathExtension().lastPathComponent, hold: true)
+        if startInfo { setInfo(true) }
+    }
 
     private var engine: ScrubEngine?
     private var index: MediaIndex?
@@ -398,7 +424,10 @@ final class PlayerView: NSView {
             }
             guard let backend else { return }
             if let s = startSound { backend.volume = s.volume; backend.isMuted = s.muted }
-            if startInfo { setInfo(true) }
+            if startInfo || !infoPanel.isHidden {
+                infoTask?.cancel(); infoTask = nil         // read again, now that the decoder is known
+                setInfo(true)
+            }
             Trace.log(String(format: "open %.1f ms", (CACurrentMediaTime() - opened) * 1000))
             CATransaction.begin(); CATransaction.setDisableActions(true)
             backend.layer.frame = videoHost.bounds
@@ -611,11 +640,13 @@ final class PlayerView: NSView {
     }
 
     private func skip(_ by: Double) {
+        guard pendingURL == nil else { return }
         let base = currentFrame.flatMap { index?.seconds($0) } ?? backend?.currentSeconds ?? 0
         seek(seconds: base + by, settleAfter: 0.25)
     }
 
     private func stepFrame(_ n: Int) {
+        guard pendingURL == nil else { return }
         if index == nil, let ff = backend as? FFPlayback { ff.step(n); return }
         guard let d = currentFrame, let index else { return }
         seek(toFrame: index.step(d, by: n), settleAfter: 0.4)
@@ -642,6 +673,12 @@ final class PlayerView: NSView {
     @objc func togglePlay() {
         Trace.log("app toggle target \(target ?? -1) playing \(backend?.isPlaying ?? false) exact \(exactShown)")
         trimWork?.cancel(); pendingTrim = nil
+        if let u = pendingURL {
+            pendingURL = nil
+            status.alphaValue = 0
+            load(u)                                     // opens and plays
+            return
+        }
         if target != nil {
             resumeAfterSeek.toggle()
             settleWork?.cancel()
@@ -865,6 +902,9 @@ final class PlayerView: NSView {
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         if !item.keyEquivalent.isEmpty, !item.keyEquivalentModifierMask.contains(.command), window != NSApp.keyWindow { return false }
         switch item.action {
+        case #selector(togglePlay) where pendingURL != nil:
+            item.title = "Play"
+            return true
         case #selector(togglePlay):
             let playing = target != nil ? resumeAfterSeek : backend?.isPlaying ?? false
             item.title = playing ? "Pause" : "Play"

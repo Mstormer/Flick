@@ -268,7 +268,7 @@ final class HelpWindow: NSWindowController {
         text.append(NSAttributedString(string: "Playlist\n", attributes: k))
         text.append(NSAttributedString(string: "\nPlaylists\n", attributes: h))
         text.append(NSAttributedString(string: "Open or drop several videos, or a folder (searched with its subfolders), to play them in one window. "
-            + "↑ and ↓ move through the list and ⌥↑ ⌥↓ set the volume; L shows or hides the list; the next video starts when one ends.\n", attributes: b))
+            + "↑ and ↓ move through the list and ⌥↑ ⌥↓ set the volume; L shows or hides the list; the next video starts when one ends. While paused, switching shows only the name until you press Play.\n", attributes: b))
 
         text.append(NSAttributedString(string: "\nOpen-Source Software\n", attributes: h))
         text.append(NSAttributedString(string: "WMV, VC-1, WMA, DTS, TrueHD, Vorbis and some VP9 files are decoded with libavformat, "
