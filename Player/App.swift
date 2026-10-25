@@ -207,7 +207,7 @@ final class PlayerWindowController: NSWindowController, NSWindowDelegate {
 
     private func updateMenuKeys() { MainMenu.setPlaylistMode(items.count > 1, visible: !list.isHidden) }
     func windowDidBecomeKey(_ n: Notification) { updateMenuKeys() }
-    func windowWillClose(_ n: Notification) { view.teardown(); onClose?() }
+    func windowWillClose(_ n: Notification) { view.teardown(); onClose?(); FreeMemory.giveBack(after: 1.5) }
 }
 
 /// The window's content: the player, the playlist over its right side, and the drop target for files.
@@ -422,6 +422,7 @@ final class PlayerView: NSView {
                           return (m, i)
                       }).value, let idx {
                 let native = NativePlayback(mkv: mkv, index: idx)
+                mkv.dropPlaybackPackets()
                 native.onEnd = { [weak self] in self?.controls.setTime(self?.duration ?? 0, playing: false); self?.finished() }
                 backend = native
                 newIndex = idx
@@ -434,6 +435,7 @@ final class PlayerView: NSView {
                 let mkv = MKVFile(url: url)
                 guard let (v, a) = await Task.detached(operation: { FFPlayback.open(url, audio: mkv.flatMap(MKVCodecs.audioSource)) }).value
                 else { flash(status, "Can't open this file"); return }
+                mkv?.dropPlaybackPackets()
                 let ff = FFPlayback(video: v, audio: a)
                 ff.onEnd = { [weak self] in self?.controls.setTime(self?.duration ?? 0, playing: false); self?.finished() }
                 backend = ff
@@ -443,6 +445,7 @@ final class PlayerView: NSView {
                 previewSource = FFThumbnailer(url: url)
             }
             guard let backend else { return }
+            FreeMemory.giveBack(after: 0.5)            // indexing a long file leaves tens of MB of freed tables
             if let s = startSound { backend.volume = s.volume; backend.isMuted = s.muted }
             if Self.startMuted { backend.isMuted = true }
             if startInfo || !infoPanel.isHidden {
@@ -1205,6 +1208,14 @@ final class BadgeLabel: NSTextField {
             return t
         }
         override func drawInterior(withFrame f: NSRect, in v: NSView) { super.drawInterior(withFrame: titleRect(forBounds: f), in: v) }
+    }
+}
+
+/// macOS's allocator keeps freed blocks for reuse, and they still count against the app. After the big
+/// one-off allocations (indexing a file, closing a window) hand them back to the system.
+enum FreeMemory {
+    static func giveBack(after delay: Double) {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { _ = malloc_zone_pressure_relief(nil, 0) }
     }
 }
 

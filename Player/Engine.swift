@@ -2,6 +2,14 @@ import AVFoundation
 import CoreMedia
 import VideoToolbox
 
+extension Array {
+    /// The same elements in storage of exactly their size: tables built by appending keep up to twice
+    /// the room they need.
+    var compacted: [Element] {
+        Array(unsafeUninitializedCapacity: count) { b, n in n = b.initialize(from: self).1 }
+    }
+}
+
 /// One video sample, in decode order.
 struct Sample {
     var pts: Int64
@@ -38,8 +46,11 @@ final class MediaIndex {
         let ts = (try? await track.load(.naturalTimeScale)) ?? 600
         let url = asset.url.standardizedFileURL.absoluteURL
 
+        // room for every frame up front (growing a large table leaves the old copies with the allocator)
+        let fps = Double((try? await track.load(.nominalFrameRate)) ?? 0)
+        let secs = (try? await track.load(.timeRange))?.duration.seconds ?? 0
         var out: [Sample] = []
-        out.reserveCapacity(1 << 16)
+        out.reserveCapacity(fps > 0 && secs.isFinite ? Int(fps * secs * 1.02) + 64 : 1 << 16)
         func conv(_ t: CMTime) -> Int64 { t.convertScale(ts, method: .roundHalfAwayFromZero).value }
         let ownPath = url.standardizedFileURL.path
         var lastURL: URL?
@@ -119,7 +130,7 @@ final class MediaIndex {
         dropState = .allocate(capacity: out.count)
         dropState.initialize(repeating: 0, count: out.count)
 
-        samples = out
+        samples = out.capacity > out.count + out.count / 8 ? out.compacted : out
         byPTS = out.indices.sorted { out[$0].pts < out[$1].pts }.map(Int32.init)
         syncOf = sync
         timescale = ts

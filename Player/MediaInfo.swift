@@ -207,8 +207,8 @@ struct MediaInfo {
         var info = MediaInfo()
         let d = m.duration
         func bitrate(_ t: MKVFile.Track) -> String? {
-            guard d > 0, let p = m.packets[t.number], !p.isEmpty else { return nil }
-            return rate(Double(p.reduce(0) { $0 + Int($1.size) }) * 8 / d)
+            guard d > 0, let n = m.totals[t.number], n.count > 0 else { return nil }
+            return rate(Double(n.bytes) * 8 / d)
         }
         // the track NativePlayback plays: the default one if anything decodes it, else the first that decodes
         let audio = m.audioTracks
@@ -219,7 +219,7 @@ struct MediaInfo {
             switch t.type {
             case 1:
                 // the format description playback builds carries profile, level, bit depth and colour
-                let first = m.packets[t.number]?.first.map { UnsafeRawBufferPointer(start: m.base + Int($0.offset), count: Int($0.size)) }
+                let first = m.totals[t.number]?.first.map { UnsafeRawBufferPointer(start: m.base + Int($0.offset), count: Int($0.size)) }
                 if let f = MKVCodecs.videoFormat(t, firstFrame: first) {
                     rows.append(("Codec", videoCodec(f)))
                 } else {
@@ -230,7 +230,7 @@ struct MediaInfo {
                     rows.append(("Display size", "\(t.displayWidth) × \(t.displayHeight)"))
                 }
                 if t.defaultDuration > 0 { rows.append(("Frame rate", frames(1e9 / Double(t.defaultDuration)))) }
-                else if let p = m.packets[t.number], p.count > 1, d > 0 { rows.append(("Frame rate", frames(Double(p.count) / d))) }
+                else if let n = m.totals[t.number]?.count, n > 1, d > 0 { rows.append(("Frame rate", frames(Double(n) / d))) }
                 if t.transfer == 16 { rows.append(("HDR", "HDR10 (PQ)")) } else if t.transfer == 18 { rows.append(("HDR", "HLG")) }
                 if t.primaries == 9 { rows.append(("Colour", "BT.2020")) }
                 if let b = bitrate(t) { rows.append(("Bitrate", b)) }

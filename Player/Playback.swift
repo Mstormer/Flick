@@ -123,7 +123,7 @@ extension AudioSource { var codecDelay: Double { 0 } }
 final class MKVAudio: AudioSource {
     let format: CMAudioFormatDescription
     private let mkv: MKVFile
-    private let packets: [MKVFile.Packet]
+    private let packets: MKVFile.Packets
     private let isPCM: Bool
     private let tscale: Double                     // seconds per MKV timestamp unit
     private var nextIndex = 0
@@ -134,7 +134,7 @@ final class MKVAudio: AudioSource {
         self.mkv = mkv
         format = f.0
         isPCM = f.isPCM
-        packets = mkv.packets[chosen.number] ?? []
+        packets = mkv.packets[chosen.number] ?? .init()
         tscale = Double(mkv.timecodeScale) / 1e9
         // Opus pre-skip: macOS's Opus decoder doesn't drop it (its AC-3, E-AC-3 and MP3 decoders already line up)
         // and AAC's 1024-sample decoder delay, which an MP4 records as trim but Matroska doesn't

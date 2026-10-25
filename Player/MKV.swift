@@ -34,7 +34,11 @@ final class MKVFile {
 
     let url: URL
     private(set) var tracks: [Track] = []
-    private(set) var packets: [Int: [Packet]] = [:]   // by track number
+    typealias Packets = MappedTable<Packet>
+    private(set) var packets: [Int: Packets] = [:]   // by track number
+    /// Per-track totals that outlive the packet tables (the info panel's bitrate and frame rate).
+    struct Totals { var count = 0; var bytes = 0; var first: Packet? }
+    private(set) var totals: [Int: Totals] = [:]
     private(set) var timecodeScale: Int64 = 1_000_000  // ns per timestamp unit
     private(set) var duration: Double = 0              // seconds
     let base: UnsafePointer<UInt8>
@@ -57,6 +61,13 @@ final class MKVFile {
     }
 
     deinit { munmap(raw, length) }
+
+    /// Once the players are built (they keep their own copies of what they play), the audio and video
+    /// tables aren't needed here: two hours of three audio tracks is ~30 MB. Subtitle tables stay for captions.
+    func dropPlaybackPackets() {
+        let keep = Set(tracks.filter { $0.type == 17 }.map(\.number))
+        packets = packets.filter { keep.contains($0.key) }
+    }
 
     var video: Track? { tracks.first { $0.type == 1 } }
     var audioTracks: [Track] { tracks.filter { $0.type == 2 } }
@@ -170,7 +181,10 @@ final class MKVFile {
             }
             if o <= elemStart { break }
         }
-        for k in packets.keys { packets[k]!.sort { $0.offset < $1.offset } }
+        for (k, a) in packets {
+            a.sort { $0.offset < $1.offset }
+            totals[k] = Totals(count: a.count, bytes: a.reduce(0) { $0 + Int($1.size) }, first: a.first)
+        }
         if duration <= 0, let v = video, let last = packets[v.number]?.max(by: { $0.pts < $1.pts }) {
             duration = seconds(last.pts + Int64(last.duration))
         }
@@ -222,7 +236,7 @@ final class MKVFile {
             default: break
             }
         }
-        if t.number > 0 { tracks.append(t); packets[t.number] = [] }
+        if t.number > 0 { tracks.append(t); packets[t.number] = Packets() }
     }
 
     /// Returns where parsing stopped (needed for unknown-size clusters).
@@ -266,7 +280,7 @@ final class MKVFile {
         let track = Int(tn)
         let lacing = (flags >> 1) & 3
         if lacing == 0 {
-            packets[track]!.append(Packet(pts: pts, offset: Int64(o), size: Int32(end - o), keyframe: key, discardable: disc, duration: Int32(duration)))
+            packets[track]?.append(Packet(pts: pts, offset: Int64(o), size: Int32(end - o), keyframe: key, discardable: disc, duration: Int32(duration)))
             return
         }
         // Laced frames (audio): split, and give each its own timestamp from the track's frame duration.
@@ -300,8 +314,48 @@ final class MKVFile {
         let ns = tracks.first { $0.number == track }?.defaultDuration ?? 0
         let step = ns > 0 ? Int64((Double(ns) / Double(timecodeScale)).rounded()) : 0
         for (i, s) in sizes.enumerated() where s > 0 && o + s <= end {
-            packets[track]!.append(Packet(pts: pts + Int64(i) * step, offset: Int64(o), size: Int32(s), keyframe: key, discardable: disc, duration: Int32(step)))
+            packets[track]?.append(Packet(pts: pts + Int64(i) * step, offset: Int64(o), size: Int32(s), keyframe: key, discardable: disc, duration: Int32(step)))
             o += s
         }
+    }
+}
+
+/// A table of plain values in memory mapped straight from the system rather than the allocator. Growing
+/// copies it to a fresh mapping and unmaps the old one, so the pages go back to macOS at once (freed Swift
+/// arrays this size stay cached by the allocator, still counted against the app: ~100 MB after indexing
+/// a two-hour film). Pages past the end are never touched and cost nothing. Filled once, then read-only.
+final class MappedTable<Element: BitwiseCopyable>: RandomAccessCollection {
+    private var base: UnsafeMutablePointer<Element>?
+    private var capacity = 0
+    private(set) var count = 0
+
+    init() {}
+    deinit { if let base { munmap(base, capacity * MemoryLayout<Element>.stride) } }
+
+    var startIndex: Int { 0 }
+    var endIndex: Int { count }
+    subscript(i: Int) -> Element { precondition(i >= 0 && i < count); return base![i] }
+
+    func append(_ e: Element) {
+        if count == capacity { grow() }
+        base![count] = e
+        count += 1
+    }
+
+    func sort(by less: (Element, Element) -> Bool) {
+        guard let base, count > 1 else { return }
+        var b = UnsafeMutableBufferPointer(start: base, count: count)
+        if zip(b, b.dropFirst()).contains(where: { less($1, $0) }) { b.sort(by: less) }   // file order normally is offset order
+    }
+
+    private func grow() {
+        let stride = MemoryLayout<Element>.stride
+        let n = Swift.max(16384 / stride, capacity * 2)                       // whole pages
+        guard let p = mmap(nil, n * stride, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0), p != MAP_FAILED
+        else { fatalError("out of memory") }
+        let fresh = p.bindMemory(to: Element.self, capacity: n)
+        if let base { fresh.update(from: base, count: count); munmap(base, capacity * stride) }
+        base = fresh
+        capacity = n
     }
 }

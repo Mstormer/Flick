@@ -214,13 +214,13 @@ final class FFAudio: AudioSource {
 /// Matroska audio packets (already split from their laces) for FFAudio.
 final class MKVPacketFeed: PacketFeed {
     private let mkv: MKVFile
-    private let packets: [MKVFile.Packet]
+    private let packets: MKVFile.Packets
     let timeBase: AVRational
     private var nextIndex = 0
 
     init(_ mkv: MKVFile, track: MKVFile.Track) {
         self.mkv = mkv
-        packets = mkv.packets[track.number] ?? []
+        packets = mkv.packets[track.number] ?? .init()
         timeBase = AVRational(num: 1, den: Int32(clamping: 1_000_000_000 / max(1, mkv.timecodeScale)))
     }
 

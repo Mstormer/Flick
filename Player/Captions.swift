@@ -122,7 +122,7 @@ enum CaptionParser {
         guard kind == nil else { return .unsupported(title: "\(name) (\(t.codecID == "S_HDMV/PGS" ? "image subtitles" : t.codecID))") }
         let ass = t.codecID.contains("ASS") || t.codecID.contains("SSA")
         var cues: [Cue] = []
-        let pk = mkv.packets[t.number] ?? []
+        let pk = mkv.packets[t.number] ?? .init()
         for (i, p) in pk.enumerated() {
             let s = String(decoding: UnsafeBufferPointer(start: mkv.base + Int(p.offset), count: Int(p.size)), as: UTF8.self)
             var body = s
