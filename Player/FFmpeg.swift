@@ -33,7 +33,7 @@ protocol PacketFeed: AnyObject {
     func next(_ pkt: UnsafeMutablePointer<AVPacket>) -> Bool
 }
 
-/// Decoded to interleaved Float32 for the audio renderer. Used on one queue only.
+/// Decoded to interleaved Float32 for AudioOut. Used on one queue only.
 final class FFAudio: AudioSource {
     let format: CMAudioFormatDescription
     private let ctx: UnsafeMutablePointer<AVCodecContext>
@@ -250,6 +250,7 @@ extension MKVCodecs {
         case "A_TRUEHD": return AV_CODEC_ID_TRUEHD
         case "A_MLP": return AV_CODEC_ID_MLP
         case "A_VORBIS": return AV_CODEC_ID_VORBIS
+        case "A_ALAC": return AV_CODEC_ID_ALAC
         default: return nil
         }
     }
@@ -261,7 +262,10 @@ extension MKVCodecs {
         func make(_ t: MKVFile.Track) -> AudioSource? {
             if audioFormat(t) != nil { return MKVAudio(mkv, track: t) }
             guard let id = ffAudioCodec(t) else { return nil }
-            return FFAudio(codec: id, extradata: t.codecPrivate, sampleRate: Int(t.sampleRate), channels: t.channels,
+            var extra = t.codecPrivate
+            // Matroska keeps ALAC's bare 24-byte config; FFmpeg wants it inside its 'alac' atom
+            if id == AV_CODEC_ID_ALAC, let c = extra, c.count == 24 { extra = Data([0, 0, 0, 36]) + Data("alac".utf8) + Data(count: 4) + c }
+            return FFAudio(codec: id, extradata: extra, sampleRate: Int(t.sampleRate), channels: t.channels,
                            feed: MKVPacketFeed(mkv, track: t))
         }
         for t in tracks.filter(\.isDefault) + tracks { if let s = make(t) { return s } }
@@ -525,10 +529,9 @@ final class FFVideo {
 final class FFPlayback: Playback {
     private let video: FFVideo
     private let display = AVSampleBufferDisplayLayer()
-    private let audio = AVSampleBufferAudioRenderer()
+    private var sound: SyncedAudio?
     private let sync = AVSampleBufferRenderSynchronizer()
     private let q = DispatchQueue(label: "flick.ff.video", qos: .userInitiated)
-    private let aq = DispatchQueue(label: "flick.ff.audio", qos: .userInitiated)
     private let audioSource: AudioSource?
     private let wanted = Latest()                  // newest seek; a decode for an older one stops
     // on q
@@ -569,36 +572,37 @@ final class FFPlayback: Playback {
         duration = v.demux.duration
         displaySize = v.displaySize
         display.videoGravity = .resizeAspect
-        audio.audioTimePitchAlgorithm = .timeDomain
         sync.addRenderer(display.sampleBufferRenderer)
-        if audioSource != nil { sync.addRenderer(audio) }
+        sound = source.flatMap { SyncedAudio(source: $0, sync: sync) }
         sync.delaysRateChangeUntilHasSufficientMediaData = false
         go(to: 0)
     }
 
     var currentSeconds: Double { max(0, sync.currentTime().seconds - start) }
-    var volume: Float { get { audio.volume } set { audio.volume = newValue } }
-    var isMuted: Bool { get { audio.isMuted } set { audio.isMuted = newValue } }
+    private var level: (volume: Float, muted: Bool) = (1, false)       // kept when there's no audio
+    var volume: Float { get { sound?.volume ?? level.volume } set { level.volume = newValue; sound?.volume = newValue } }
+    var isMuted: Bool { get { sound?.isMuted ?? level.muted } set { level.muted = newValue; sound?.isMuted = newValue } }
 
     func play(rate r: Float) {
         rate = r
         if currentSeconds >= min(duration, dataEnd.value - start) - 0.05 { seek(to: 0) { _ in } }
         isPlaying = true
-        sync.setRate(r, time: sync.currentTime())
         startEndWatch()
+        if sound == nil { sync.setRate(r, time: sync.currentTime()) }
         let g = wanted.value
-        q.async { [self] in pump(g) }
+        q.async { [self] in sound?.play(rate: r); pump(g) }       // after any reset queued by a seek
     }
 
     func pause() {
         isPlaying = false
         sync.rate = 0
+        sound?.pause()
         endTimer?.invalidate()
     }
 
     func setRate(_ r: Float) {
         rate = r
-        if isPlaying { sync.rate = r }
+        if let sound { sound.setRate(r, playing: isPlaying) } else if isPlaying { sync.rate = r }
         let g = wanted.value
         q.async { [self] in pump(g) }
     }
@@ -610,7 +614,10 @@ final class FFPlayback: Playback {
         sync.rate = 0
         go(to: seconds) { [weak self] ok in
             guard let self else { return }
-            if wasPlaying && self.isPlaying { self.sync.setRate(self.rate, time: self.sync.currentTime()) }
+            if wasPlaying && self.isPlaying {
+                if let s = self.sound { self.q.async { s.play(rate: self.rate) } }
+                else { self.sync.setRate(self.rate, time: self.sync.currentTime()) }
+            }
             completion(ok)
         }
     }
@@ -626,7 +633,7 @@ final class FFPlayback: Playback {
         pause()
         wanted.bump()
         display.sampleBufferRenderer.stopRequestingMediaData()
-        audio.stopRequestingMediaData()
+        sound?.stop()
     }
 
     // MARK: feeding
@@ -645,13 +652,9 @@ final class FFPlayback: Playback {
             pumpPending = false
             hideBefore = target
             video.seek(to: target)
-            aq.async { [self] in
-                audio.stopRequestingMediaData()
-                audio.flush()
-                guard g == wanted.value, let src = audioSource else { return }
-                src.reset(at: target - 0.05)
-                audio.requestMediaDataWhenReady(on: aq) { [weak self] in self?.feedAudio(g) }
-            }
+            // audio waits (paused) at the exact target until play resumes
+            sound?.pause()
+            sound?.reset(at: target)
             pump(g)
             if let completion { waitForPicture(g, deadline: CACurrentMediaTime() + 3, completion) }
         }
@@ -725,14 +728,6 @@ final class FFPlayback: Playback {
         q.asyncAfter(deadline: .now() + 0.004) { [weak self] in self?.waitForPicture(g, deadline: deadline, completion) }
     }
 
-    private func feedAudio(_ g: Int) {
-        guard let src = audioSource else { return }
-        while g == wanted.value && audio.isReadyForMoreMediaData {
-            guard let sb = src.next() else { audio.stopRequestingMediaData(); return }
-            audio.enqueue(sb)
-        }
-    }
-
     private func startEndWatch() {
         endTimer?.invalidate()
         defer { endTimer?.tolerance = 0.1 }
@@ -742,6 +737,7 @@ final class FFPlayback: Playback {
                 self.pause()
                 self.onEnd?()
             }
+            self.sound?.steer(rate: self.rate)
         }
     }
 }

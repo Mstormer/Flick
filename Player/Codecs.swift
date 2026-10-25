@@ -134,8 +134,7 @@ enum MKVCodecs {
                 asbd.mFormatFlags = [16: 1, 20: 2, 24: 3, 32: 4][bps] ?? 1
             }
         case "A_ALAC":
-            asbd.mFormatID = kAudioFormatAppleLossless
-            cookie = t.codecPrivate
+            return nil   // FFmpeg's decoder (AudioToolbox's rejects Matroska's packets)
         case "A_PCM/INT/LIT", "A_PCM/FLOAT/IEEE":
             pcm = true
             let bits = t.bitDepth > 0 ? t.bitDepth : 16

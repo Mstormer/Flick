@@ -104,10 +104,8 @@ final class AVPlayerPlayback: Playback {
 
 // MARK: - Native (Matroska)
 
-/// Compressed video and audio straight from the MKV packet table into Apple's sample-buffer renderers,
-/// both slaved to one render synchronizer. Speed changes are a synchronizer rate change; the audio
-/// renderer time-stretches with pitch correction (time-domain: 'spectral' re-renders on every change,
-/// stalling the clock ~60 ms).
+/// Video decoded here into a sample-buffer display layer on a render synchronizer; audio through
+/// SyncedAudio (AVAudioEngine), which the synchronizer follows. Speed changes are instant on both.
 /// Audio for NativePlayback, from wherever the file keeps it. Used on the player's feed queue only.
 protocol AudioSource: AnyObject {
     var format: CMAudioFormatDescription { get }
@@ -115,7 +113,11 @@ protocol AudioSource: AnyObject {
     func reset(at seconds: Double)
     /// The next buffer to play, or nil at the end.
     func next() -> CMSampleBuffer?
+    /// How far decoded audio runs behind the buffers' timestamps (encoder priming, Opus pre-skip), seconds.
+    var codecDelay: Double { get }
 }
+
+extension AudioSource { var codecDelay: Double { 0 } }
 
 /// Matroska audio packets straight from the mapped file.
 final class MKVAudio: AudioSource {
@@ -125,6 +127,7 @@ final class MKVAudio: AudioSource {
     private let isPCM: Bool
     private let tscale: Double                     // seconds per MKV timestamp unit
     private var nextIndex = 0
+    let codecDelay: Double
 
     init?(_ mkv: MKVFile, track chosen: MKVFile.Track) {
         guard let f = MKVCodecs.audioFormat(chosen) else { return nil }
@@ -133,6 +136,10 @@ final class MKVAudio: AudioSource {
         isPCM = f.isPCM
         packets = mkv.packets[chosen.number] ?? []
         tscale = Double(mkv.timecodeScale) / 1e9
+        // Opus pre-skip: macOS's Opus decoder doesn't drop it (its AC-3, E-AC-3 and MP3 decoders already line up)
+        // and AAC's 1024-sample decoder delay, which an MP4 records as trim but Matroska doesn't
+        codecDelay = chosen.codecID == "A_OPUS" ? Double(chosen.codecDelay) / 1e9
+                   : chosen.codecID.hasPrefix("A_AAC") ? 1024 / max(1, chosen.sampleRate) : 0
     }
 
     func reset(at seconds: Double) {
@@ -172,19 +179,39 @@ final class MKVAudio: AudioSource {
     }
 }
 
-/// MP4/MOV audio, still compressed, through AVAssetReader (a new reader per seek).
+/// MP4/MOV audio decoded to PCM by AVAssetReader (a new reader per seek), which also applies the file's
+/// priming and edit lists, so every buffer's time is exact.
 final class AssetAudio: AudioSource {
     let format: CMAudioFormatDescription
     private let asset: AVURLAsset
     private let track: AVAssetTrack
     private let shift: CMTime                      // movie time → the video's media timeline (edit lists)
+    private let settings: [String: Any]
     private var reader: AVAssetReader?
     private var output: AVAssetReaderTrackOutput?
 
-    init(asset: AVURLAsset, track: AVAssetTrack, format: CMAudioFormatDescription, shift: CMTime) {
+    init?(asset: AVURLAsset, track: AVAssetTrack, format source: CMAudioFormatDescription, shift: CMTime) {
+        guard let d = CMAudioFormatDescriptionGetStreamBasicDescription(source)?.pointee, d.mSampleRate > 0, d.mChannelsPerFrame > 0 else { return nil }
+        // interleaved Float32 at the track's own rate and channel count, keeping its channel layout
+        var asbd = AudioStreamBasicDescription(mSampleRate: d.mSampleRate, mFormatID: kAudioFormatLinearPCM,
+                                               mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+                                               mBytesPerPacket: 4 * d.mChannelsPerFrame, mFramesPerPacket: 1,
+                                               mBytesPerFrame: 4 * d.mChannelsPerFrame, mChannelsPerFrame: d.mChannelsPerFrame,
+                                               mBitsPerChannel: 32, mReserved: 0)
+        var size = 0
+        let layout = CMAudioFormatDescriptionGetChannelLayout(source, sizeOut: &size)
+        var f: CMAudioFormatDescription?
+        guard CMAudioFormatDescriptionCreate(allocator: nil, asbd: &asbd, layoutSize: layout != nil ? size : 0, layout: layout,
+                                             magicCookieSize: 0, magicCookie: nil, extensions: nil, formatDescriptionOut: &f) == noErr,
+              let f else { return nil }
+        var s: [String: Any] = [AVFormatIDKey: kAudioFormatLinearPCM, AVLinearPCMBitDepthKey: 32, AVLinearPCMIsFloatKey: true,
+                                AVLinearPCMIsNonInterleaved: false, AVLinearPCMIsBigEndianKey: false,
+                                AVSampleRateKey: d.mSampleRate, AVNumberOfChannelsKey: Int(d.mChannelsPerFrame)]
+        if let layout { s[AVChannelLayoutKey] = Data(bytes: layout, count: size) }
+        settings = s
+        format = f
         self.asset = asset
         self.track = track
-        self.format = format
         self.shift = shift
     }
 
@@ -192,7 +219,7 @@ final class AssetAudio: AudioSource {
         reader?.cancelReading()
         reader = nil; output = nil
         guard let r = try? AVAssetReader(asset: asset) else { return }
-        let o = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        let o = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
         o.alwaysCopiesSampleData = false
         guard r.canAdd(o) else { return }
         r.add(o)
@@ -220,7 +247,7 @@ final class NativePlayback: Playback {
     private var display = AVSampleBufferDisplayLayer()
     private(set) var isSuspended = false
     private weak var host: CALayer?
-    private let audio = AVSampleBufferAudioRenderer()
+    private var sound: SyncedAudio?
     private let sync = AVSampleBufferRenderSynchronizer()
     private let q = DispatchQueue(label: "flick.native.feed", qos: .userInitiated)
     private let audioSource: AudioSource?
@@ -244,7 +271,6 @@ final class NativePlayback: Playback {
     private var outstanding: [Int64] = []          // pts of frames handed to the decoder, not out yet
     private var reorder: [(pts: Int64, time: CMTime, image: CVImageBuffer)] = []
     private var pumpPending = false
-    private var audioTraced = -1
     private var targetQueuedGen = -1               // generation whose exact-seek target has reached the layer
     private var sessionBroken = false
     private let fps: Double
@@ -268,9 +294,8 @@ final class NativePlayback: Playback {
         grid = cfr ? (first, step) : nil
         fps = cfr ? Double(index.timescale) / step : 1 / max(index.frameDuration, 0.001)
         display.videoGravity = .resizeAspect
-        audio.audioTimePitchAlgorithm = .timeDomain
         sync.addRenderer(display.sampleBufferRenderer)
-        if audioSource != nil { sync.addRenderer(audio) }
+        sound = source.flatMap { SyncedAudio(source: $0, sync: sync) }
         sync.delaysRateChangeUntilHasSufficientMediaData = false
         start(at: 0)
     }
@@ -302,7 +327,8 @@ final class NativePlayback: Playback {
             // audio comes out on the movie timeline; the video index is on the track's own timeline
             let seg = (try? await v.load(.segments))?.first { !$0.isEmpty }
             let shift = seg.map { CMTimeSubtract($0.timeMapping.source.start, $0.timeMapping.target.start) } ?? .zero
-            source = AssetAudio(asset: asset, track: a, format: afmt, shift: shift)
+            guard let src = AssetAudio(asset: asset, track: a, format: afmt, shift: shift) else { return nil }
+            source = src
         }
         guard let idx = await MediaIndex(asset: asset), ScrubEngine.canDecode(idx) else { return nil }
         return (NativePlayback(index: idx, audio: source), idx)
@@ -310,17 +336,16 @@ final class NativePlayback: Playback {
 
     var currentSeconds: Double { max(0, sync.currentTime().seconds - Double(index.startPTS) / Double(index.timescale)) }
     var usesFFmpegAudio: Bool { audioSource is FFAudio }
-    var volume: Float { get { audio.volume } set { audio.volume = newValue } }
-    var isMuted: Bool { get { audio.isMuted } set { audio.isMuted = newValue } }
+    private var level: (volume: Float, muted: Bool) = (1, false)       // kept when there's no audio
+    var volume: Float { get { sound?.volume ?? level.volume } set { level.volume = newValue; sound?.volume = newValue } }
+    var isMuted: Bool { get { sound?.isMuted ?? level.muted } set { level.muted = newValue; sound?.isMuted = newValue } }
 
     func suspend() {
         guard !isSuspended else { return }
         pause()
         q.sync { gen &+= 1 }
         display.sampleBufferRenderer.stopRequestingMediaData()
-        audio.stopRequestingMediaData()
         display.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
-        audio.flush()
         q.sync { dropSession() }
         sync.removeRenderer(display.sampleBufferRenderer, at: sync.currentTime(), completionHandler: nil)
         // a display layer keeps its decoder (and its frame pool) until the layer itself goes away
@@ -352,20 +377,21 @@ final class NativePlayback: Playback {
         rate = r
         if currentSeconds >= duration - 0.05 { seek(to: 0) { _ in } }
         isPlaying = true
-        sync.setRate(r, time: sync.currentTime())
         startEndWatch()
-        q.async { [self] in pump(gen) }
+        if sound == nil { sync.setRate(r, time: sync.currentTime()) }
+        q.async { [self] in sound?.play(rate: r); pump(gen) }     // after any reset queued by a seek
     }
 
     func pause() {
         isPlaying = false
         sync.rate = 0
+        sound?.pause()
         endTimer?.invalidate()
     }
 
     func setRate(_ r: Float) {
         rate = r
-        if isPlaying { sync.rate = r }
+        if let sound { sound.setRate(r, playing: isPlaying) } else if isPlaying { sync.rate = r }
         q.async { [self] in pump(gen) }
     }
 
@@ -377,7 +403,10 @@ final class NativePlayback: Playback {
         sync.rate = 0
         start(at: seconds) { [weak self] ok in
             guard let self else { return }
-            if wasPlaying && self.isPlaying { self.sync.setRate(self.rate, time: self.sync.currentTime()) }
+            if wasPlaying && self.isPlaying {
+                if let s = self.sound { self.q.async { s.play(rate: self.rate) } }
+                else { self.sync.setRate(self.rate, time: self.sync.currentTime()) }
+            }
             completion(ok)
         }
     }
@@ -386,7 +415,7 @@ final class NativePlayback: Playback {
         pause()
         q.sync { gen &+= 1; dropSession() }
         display.sampleBufferRenderer.stopRequestingMediaData()
-        audio.stopRequestingMediaData()
+        sound?.stop()
     }
 
     // MARK: feeding
@@ -403,14 +432,12 @@ final class NativePlayback: Playback {
             gen &+= 1
             let g = gen
             display.sampleBufferRenderer.stopRequestingMediaData()
-            audio.stopRequestingMediaData()
             // The hand-off back from the scrub layer waits for this flush to land, then for a picture:
             // displayedPixelBuffer() hands out a new object each call, so comparing identities proves nothing.
             flushedGen = -1
             display.sampleBufferRenderer.flush(removingDisplayedImage: true) { [weak self] in
                 self?.q.async { self?.flushedGen = g }
             }
-            audio.flush()
             sync.setRate(0, time: pts(targetPTS))
             vNext = start
             hideBefore = targetPTS
@@ -420,10 +447,10 @@ final class NativePlayback: Playback {
             reorder = []
             pumpPending = false
             if sessionBroken { dropSession() }
-            let at = Double(targetPTS) / Double(index.timescale) - 0.05
-            audioSource?.reset(at: at)
+            // audio waits (paused) at the exact target until play resumes
+            sound?.pause()
+            sound?.reset(at: Double(targetPTS) / Double(index.timescale))
             pump(g)
-            if audioSource != nil { audio.requestMediaDataWhenReady(on: q) { [weak self] in self?.feedAudio(g) } }
             if let completion { waitForPicture(g, deadline: CACurrentMediaTime() + 2, completion) }
         }
     }
@@ -545,23 +572,14 @@ final class NativePlayback: Playback {
         targetQueuedGen = g
     }
 
-    private func feedAudio(_ g: Int) {
-        guard let src = audioSource else { return }
-        while g == gen && audio.isReadyForMoreMediaData {
-            guard let sb = src.next() else { audio.stopRequestingMediaData(); return }
-            if audioTraced != g { audioTraced = g; Trace.log(String(format: "audio first %.3f video target %.3f", CMSampleBufferGetPresentationTimeStamp(sb).seconds, Double(hideBefore) / Double(index.timescale))) }
-            audio.enqueue(sb)
-        }
-    }
-
     private func startEndWatch() {
         endTimer?.invalidate()
         defer { endTimer?.tolerance = 0.1 }
         endTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             guard let self, self.isPlaying else { return }
-            Trace.log(String(format: "native t=%.2f audio=%d err=%@ video=%d vNext=%d", self.currentSeconds,
-                             self.audio.status.rawValue, String(describing: self.audio.error), self.display.sampleBufferRenderer.status.rawValue,
-                             self.vNext))
+            Trace.log(String(format: "native t=%.2f video=%d vNext=%d", self.currentSeconds,
+                             self.display.sampleBufferRenderer.status.rawValue, self.vNext))
+            self.sound?.steer(rate: self.rate)
             if self.currentSeconds >= self.duration - 0.02 {
                 self.pause()
                 self.onEnd?()
