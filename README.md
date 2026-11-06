@@ -1,6 +1,6 @@
 # Flick
 
-A fast 4K video player for macOS (Apple silicon), built to out-seek Leah, IINA and mpv.
+A fast 4K video player for macOS 14 or later (Apple silicon), built to out-seek Leah, IINA and mpv.
 
 - `./make-app.sh` → `build/Flick.app`
 - Keys: ←/→ 5 s (Shift 1 s, Option 30 s), `,`/`.` frame step, space play/pause, `[`/`]` speed steps, ⌫ 1×, 1–4 set speed, ↑/↓ volume, m mute, f full screen.
