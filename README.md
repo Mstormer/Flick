@@ -17,5 +17,8 @@ A fast 4K video player for macOS 14 or later (Apple silicon), built to out-seek 
 - WMV/ASF (WMV1/2/3, VC-1, MS-MPEG4; WMA, WMA Pro, WMA Lossless) and VP9 the hardware refuses (4:4:4) play through the bundled FFmpeg libraries, decoded in software: frame-exact seeking, frame stepping, seek-bar previews, interlaced VC-1 blended. No remuxing, nothing written to disk.
 - FFmpeg: libavformat/libavcodec/libavutil 9.0.2, LGPL 2.1+, trimmed to these decoders by `Tools/build-ffmpeg.sh` (run automatically by `make-app.sh` on first build; adds 3.8 MB). Shipped as separate dylibs in Contents/Frameworks; notice in Help › Open-Source Licenses.
 
+## License
+Flick is free software, copyright © 2026 Mstormer, licensed under the [GNU General Public License version 3](LICENSE) or (at your option) any later version. You may use, study, share and change it; if you distribute Flick or a work based on it, you must do so under the same license with its source code. It comes with no warranty.
+
 ## Third-party software
 Flick uses code of [FFmpeg](https://ffmpeg.org) (libavformat, libavcodec, libavutil 9.0.2, unmodified) licensed under the [LGPL v2.1 or later](https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html). It is built without any GPL, version-3 or nonfree parts by `Tools/build-ffmpeg.sh` and shipped as separate dynamic libraries, so users can replace them. Each release attaches the exact FFmpeg source tarball; the app includes the license text, the build configuration and the LGPL notice (Help › Open-Source Licenses, and the About box). FFmpeg is a trademark of Fabrice Bellard.

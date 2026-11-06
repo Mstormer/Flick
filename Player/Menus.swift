@@ -280,6 +280,8 @@ final class HelpWindow: NSWindowController {
             + "\\ shows or hides the list. While it shows, ↑ and ↓ move through it and ⌥↑ ⌥↓ set the volume; while it's hidden, ↑ ↓ are volume and ⌥↑ ⌥↓ switch videos. While playing, the list fades with the controls. The next video starts when one ends. While paused, switching shows only the name until you press Play.\n", attributes: b))
 
         text.append(NSAttributedString(string: "\nOpen-Source Software\n", attributes: h))
+        text.append(NSAttributedString(string: "Flick is free software under the GNU General Public License version 3; its source is at "
+            + "github.com/Mstormer/Flick. ", attributes: b))
         text.append(NSAttributedString(string: "WMV, VC-1, MPEG-1/2 (DVD and camcorder video in MKV), WMA, DTS, TrueHD, Vorbis and some VP9 files are decoded with libavformat, "
             + "libavcodec and libavutil from the FFmpeg project (version 9.0.2, unmodified), licensed under the GNU Lesser "
             + "General Public License version 2.1 or later. They are separate libraries inside Flick.app/Contents/Frameworks "
