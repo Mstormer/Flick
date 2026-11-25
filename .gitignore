@@ -24,3 +24,4 @@ Bench/uitest/uitest
 Vendor/
 Bench/opentest/opentest
 Bench/colortest/colortest
+Bench/ratetest/ratetest

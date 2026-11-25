@@ -72,7 +72,7 @@ struct MediaInfo {
             if audios.count > 1 { rows.append(("Playing", (try? await t.load(.isEnabled)) == true ? "Yes" : "No")) }
             info.sections.append(Section(title: "Audio", rows: rows))
         }
-        let subs = (try? await a.loadMediaSelectionGroup(for: .legible))?.options.map(\.displayName) ?? []
+        let subs = (try? await a.loadMediaSelectionGroup(for: .legible))?.embeddedCaptions.map(\.displayName) ?? []
         if !subs.isEmpty { info.sections.append(Section(title: "Subtitles", rows: [("Tracks", subs.joined(separator: ", "))])) }
         return (info, duration)
     }

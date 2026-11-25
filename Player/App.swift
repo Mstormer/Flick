@@ -349,7 +349,9 @@ final class PlayerView: NSView {
         controls.scrubber.onStep = { [weak self] by in self?.skip(by) }
         controls.scrubber.onHover = { [weak self] f in self?.preview(at: f) }
         controls.onPlay = { [weak self] in self?.togglePlay() }
-        controls.onRate = { [weak self] in self?.faster() }
+        controls.onRate = { [weak self] v in self?.showSpeedMenu(from: v) }
+        controls.onCaptions = { [weak self] v in self?.showSubtitlesMenu(from: v) }
+        controls.onFullScreen = { [weak self] in self?.window?.toggleFullScreen(nil) }
         controls.onMute = { [weak self] in self?.toggleMute(nil) }
         controls.onVolume = { [weak self] v in self?.setVolume(v) }
 
@@ -358,8 +360,8 @@ final class PlayerView: NSView {
             t.textColor = .white
             t.alignment = .center
             t.wantsLayer = true
-            t.layer?.backgroundColor = NSColor(white: 0, alpha: 0.55).cgColor
-            t.layer?.cornerRadius = 8
+            t.layer?.backgroundColor = NSColor(white: 0, alpha: 0.6).cgColor
+            t.layer?.cornerRadius = 10
             t.alphaValue = 0
             addSubview(t)
         }
@@ -385,8 +387,8 @@ final class PlayerView: NSView {
         CATransaction.commit()
         controls.frame = NSRect(x: 0, y: 0, width: bounds.width, height: 64)
         let hw = hud.frame.width > 0 ? hud.frame.width : 100
-        hud.frame = NSRect(x: bounds.midX - hw / 2, y: bounds.maxY - 80, width: hw, height: 30)
-        status.frame = NSRect(x: bounds.midX - 160, y: bounds.midY - 15, width: 320, height: 30)
+        hud.frame = NSRect(x: bounds.midX - hw / 2, y: bounds.maxY - 80, width: hw, height: 32)
+        status.frame = NSRect(x: bounds.midX - 160, y: bounds.midY - 16, width: 320, height: 32)
         captionOverlay.frame = bounds
         let ih = infoPanel.fittingHeight
         let iw = min(InfoPanel.width, bounds.width - 24)
@@ -865,10 +867,12 @@ final class PlayerView: NSView {
         if by > 0, !b.isMuted, b.volume >= 0.999, let sys = SystemVolume.change(by: by) {
             hud.alphaValue = 0
             volumeBadge.show(sys, muted: false, in: bounds, system: true)
+            controls.setMacVolume(sys)
             return
         }
         b.volume = max(0, min(1, b.volume + by))
         if by != 0, b.isMuted { b.isMuted = false }
+        controls.setMacVolume(nil)
         hud.alphaValue = 0
         volumeBadge.show(b.volume, muted: b.isMuted, in: bounds)
         controls.setVolume(b.volume, muted: b.isMuted)
@@ -917,7 +921,7 @@ final class PlayerView: NSView {
         legibleGroup = try? await asset?.loadMediaSelectionGroup(for: .legible)
         (backend as? AVPlayerPlayback)?.legibleGroup = legibleGroup
         if let group = legibleGroup {
-            sources += group.options.map { .embedded($0) }
+            sources += group.embeddedCaptions.map { .embedded($0) }
         }
         if let mkv {
             sources += mkv.tracks.filter { $0.type == 17 }.map { CaptionParser.mkvTrack(mkv, $0) }
@@ -925,6 +929,7 @@ final class PlayerView: NSView {
         let sidecars = await Task.detached { CaptionParser.sidecars(for: url).compactMap(CaptionParser.load) }.value
         sources += sidecars
         captionSources = sources
+        refreshCaptionButton()
         if let item = (backend as? AVPlayerPlayback)?.player.currentItem, let group = legibleGroup,
            let current = item.currentMediaSelection.selectedMediaOption(in: group),
            let i = sources.firstIndex(where: { if case .embedded(let o) = $0 { return o == current }; return false }) {
@@ -948,6 +953,7 @@ final class PlayerView: NSView {
         let item = (backend as? AVPlayerPlayback)?.player.currentItem
         let group = legibleGroup
         captionChoice = i
+        defer { refreshCaptionButton() }
         captionOverlay.set([])
         if let group { item?.select(nil, in: group) }
         guard let i, captionSources.indices.contains(i) else { return }
@@ -1044,6 +1050,37 @@ final class PlayerView: NSView {
         controls.setVolume(b.volume, muted: b.isMuted)
     }
     @objc func setSpeedFromMenu(_ s: NSMenuItem) { setRate(Float(s.tag)) }
+    @objc private func chooseRate(_ s: NSMenuItem) { if let r = s.representedObject as? Float { setRate(r) } }
+
+    /// The speed button: every step in a menu that opens above it, the current one ticked.
+    private func showSpeedMenu(from v: NSView) {
+        let m = NSMenu()
+        for r in Self.rates.reversed() {
+            let i = m.addItem(withTitle: Self.label(r), action: #selector(chooseRate(_:)), keyEquivalent: "")
+            i.target = self; i.representedObject = r
+            i.state = abs(rate - r) < 0.001 ? .on : .off
+        }
+        if !Self.rates.contains(where: { abs($0 - rate) < 0.001 }) {      // a Settings step like 1.1×: show it too
+            let i = m.insertItem(withTitle: Self.label(rate), action: nil, keyEquivalent: "", at: 0)
+            i.state = .on; i.isEnabled = false
+        }
+        m.popUp(positioning: nil, at: NSPoint(x: 0, y: v.bounds.maxY + 4), in: v)
+        scheduleHide()
+    }
+
+    /// The captions button: the same list as View › Subtitles.
+    private func showSubtitlesMenu(from v: NSView) {
+        let m = NSMenu()
+        fillSubtitlesMenu(m)
+        for i in m.items where i.action != nil { i.target = self }
+        m.popUp(positioning: nil, at: NSPoint(x: 0, y: v.bounds.maxY + 4), in: v)
+        scheduleHide()
+    }
+
+    private func refreshCaptionButton() {
+        let usable = captionSources.contains { if case .unsupported = $0 { return false }; return true }
+        controls.setCaptions(available: usable, on: captionChoice != nil)
+    }
     @objc func performShortcutItem(_ s: NSMenuItem) {
         guard let i = s.representedObject as? Int, Shortcuts.shared.items.indices.contains(i) else { return }
         perform(Shortcuts.shared.items[i])
@@ -1334,10 +1371,28 @@ final class ControlBar: NSView {
     private let volume = NSSlider(value: 1, minValue: 0, maxValue: 1, target: nil, action: nil)
     private let gradient = CAGradientLayer()
     var onPlay: (() -> Void)?
-    var onRate: (() -> Void)?
+    var onRate: ((NSView) -> Void)?
+    var onCaptions: ((NSView) -> Void)?
+    var onFullScreen: (() -> Void)?
+    private let captionsButton = NSButton()
+    private let fullButton = NSButton()
     var onMute: (() -> Void)?
     var onVolume: ((Float) -> Void)?
-    var duration: Double = 0 { didSet { durLabel.stringValue = Self.fmt(duration); needsLayout = true } }
+    var duration: Double = 0 { didSet { refreshDuration(); needsLayout = true } }
+    /// The right-hand time shows what is left ("-12:34") instead of the length; click it to switch.
+    private var showRemaining = UserDefaults.standard.bool(forKey: "showRemaining")
+    /// The playback speed: the time left is real time at this speed (10 minutes of video left at 2x shows "-5:00").
+    private var playbackRate: Double = 1
+    private func refreshDuration() {
+        durLabel.stringValue = showRemaining ? "-" + Self.fmt(max(0, duration - time) / playbackRate) : Self.fmt(duration)
+    }
+    @objc private func tapDuration() {
+        showRemaining.toggle()
+        UserDefaults.standard.set(showRemaining, forKey: "showRemaining")
+        refreshDuration()
+        durLabel.toolTip = showRemaining ? "Time left at this speed (click for total length)" : "Total length (click for time left)"
+        needsLayout = true
+    }
     private(set) var time: Double = 0
     var isMouseInside: Bool {
         guard let w = window else { return false }
@@ -1357,14 +1412,21 @@ final class ControlBar: NSView {
         play.target = self; play.action = #selector(tapPlay)
         rateButton.isBordered = false
         rateButton.setAccessibilityLabel("Playback speed")
-        rateButton.toolTip = "Playback speed (click for faster)"
+        rateButton.toolTip = "Playback speed"
         play.toolTip = "Play/Pause (Space)"
+        for b in [captionsButton, fullButton] { b.isBordered = false; b.contentTintColor = .white; b.target = self }
+        captionsButton.action = #selector(tapCaptions); captionsButton.setAccessibilityLabel("Subtitles"); captionsButton.toolTip = "Subtitles"
+        fullButton.action = #selector(tapFull); fullButton.setAccessibilityLabel("Full screen"); fullButton.toolTip = "Full screen (⌃⌘F)"
+        setCaptions(available: false, on: false)
         rateButton.target = self; rateButton.action = #selector(tapRate)
         for l in [timeLabel, durLabel] {
             l.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
             l.textColor = NSColor(white: 1, alpha: 0.9)
         }
         durLabel.alignment = .right
+        durLabel.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(tapDuration)))
+        durLabel.toolTip = showRemaining ? "Time left at this speed (click for total length)" : "Total length (click for time left)"
+        durLabel.setAccessibilityRole(.button)
         muteButton.isBordered = false
         muteButton.contentTintColor = .white
         muteButton.target = self; muteButton.action = #selector(tapMute)
@@ -1376,7 +1438,7 @@ final class ControlBar: NSView {
         volume.target = self; volume.action = #selector(slideVolume)
         volume.setAccessibilityLabel("Volume")
         volume.toolTip = "Volume (↑ ↓ or two-finger swipe)"
-        [play, muteButton, volume, timeLabel, scrubber, durLabel, rateButton].forEach(addSubview)
+        [play, muteButton, volume, timeLabel, scrubber, durLabel, rateButton, captionsButton, fullButton].forEach(addSubview)
         setTime(0, playing: true)
         setVolume(1, muted: false)
     }
@@ -1400,10 +1462,20 @@ final class ControlBar: NSView {
         place(play, x, playW, 28); x += playW + gap
         place(timeLabel, x - 2, labelW, 16); x += labelW - 4 + gap
         var r = bounds.width - edge
+        let fs = window?.styleMask.contains(.fullScreen) == true
+        let fullName = fs ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right"
+        if fullButton.image?.accessibilityDescription != fullName {
+            fullButton.image = NSImage(systemSymbolName: fullName, accessibilityDescription: fullName)?.withSymbolConfiguration(.init(pointSize: 14, weight: .semibold))
+        }
+        fullButton.setAccessibilityLabel(fs ? "Exit full screen" : "Full screen")
+        let fullW = ceil(fullButton.image?.size.width ?? 16), capW = ceil(captionsButton.image?.size.width ?? 20)
+        place(fullButton, r - fullW, fullW, 24); r -= fullW + gap
+        place(captionsButton, r - capW, capW, 24); r -= capW + gap
         place(volume, r - 74, 76, 20); r -= 72 + gap          // the slider draws its knob 2 pt inside its frame
         place(muteButton, r - muteW, muteW, 24); r -= muteW + gap
         place(rateButton, r - rateW, rateW, 24); r -= rateW + gap
-        place(durLabel, r - labelW + 2, labelW, 16); r -= labelW - 4 + gap
+        let durW = labelW + (showRemaining ? ceil(NSAttributedString(string: "-", attributes: [.font: durLabel.font!]).size().width) : 0)
+        place(durLabel, r - durW + 2, durW, 16); r -= durW - 4 + gap
         // the bar's track is inset 6 pt inside its frame
         place(scrubber, x - 6, max(40, r - x + 12), 28)
     }
@@ -1426,6 +1498,7 @@ final class ControlBar: NSView {
         if timeLabel.stringValue != label {          // only when the second changes
             timeLabel.stringValue = label
             scrubber.timeText = "\(label) of \(Self.fmt(duration))"
+            if showRemaining { refreshDuration() }
         }
         scrubber.progress = duration > 0 ? t / duration : 0
         let name = playing ? "pause.fill" : "play.fill"
@@ -1436,14 +1509,33 @@ final class ControlBar: NSView {
     }
 
     func setRate(_ r: Float) {
+        playbackRate = r > 0 ? Double(r) : 1
+        if showRemaining { refreshDuration() }
         rateButton.attributedTitle = NSAttributedString(string: PlayerView.label(r), attributes: [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .bold),
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .medium),
             .foregroundColor: r == 1 ? NSColor(white: 1, alpha: 0.75) : NSColor.systemYellow])
         needsLayout = true
     }
 
     @objc private func tapPlay() { onPlay?() }
-    @objc private func tapRate() { onRate?() }
+    @objc private func tapRate() { onRate?(rateButton) }
+    @objc private func tapCaptions() { onCaptions?(captionsButton) }
+    @objc private func tapFull() { onFullScreen?() }
+
+    /// Dimmed while the video has no subtitles; filled while they show.
+    func setCaptions(available: Bool, on: Bool) {
+        let name = on ? "captions.bubble.fill" : "captions.bubble"
+        captionsButton.image = NSImage(systemSymbolName: name, accessibilityDescription: name)?.withSymbolConfiguration(.init(pointSize: 14, weight: .semibold))
+        captionsButton.alphaValue = available ? 1 : 0.4
+        captionsButton.isEnabled = available
+        captionsButton.toolTip = available ? "Subtitles" : "No subtitles"
+        needsLayout = true
+    }
+
+    /// Past 100% the slider stays full; its tooltip says where the Mac's own volume is (nil: back to the player's).
+    func setMacVolume(_ v: Float?) {
+        volume.toolTip = v.map { "Volume 100%, Mac \(Int(($0 * 100).rounded()))% (↑ ↓ or two-finger swipe)" } ?? "Volume (↑ ↓ or two-finger swipe)"
+    }
     @objc private func tapMute() { onMute?() }
     @objc private func slideVolume() { onVolume?(Float(volume.doubleValue)) }
 
@@ -1576,14 +1668,15 @@ final class VolumeBadge: NSView {
         let pct = Int((v * 100).rounded())
         icon.image = NSImage(systemSymbolName: ControlBar.speakerSymbol(v, muted: muted), accessibilityDescription: nil)
         label.stringValue = muted ? "Muted" : system ? "Mac \(pct)%" : "\(pct)%"
-        let w: CGFloat = system ? 132 : 112, h: CGFloat = 34
-        // top centre, on the same line as the speed badge (30 pt tall, its bottom 80 pt below the top)
-        frame = NSRect(x: (host.midX - w / 2).rounded(), y: host.maxY - 80 - (h - 30) / 2, width: w, height: h)
-        icon.frame = NSRect(x: 10, y: 9, width: 22, height: 16)
-        label.frame = NSRect(x: 34, y: 9, width: w - 44, height: 16)
+        let w: CGFloat = system ? 128 : 104, h: CGFloat = 44
+        // top centre, centred on the speed badge's line (same corner radius and backing)
+        frame = NSRect(x: (host.midX - w / 2).rounded(), y: host.maxY - 80 - (h - 32) / 2, width: w, height: h)
+        // 12 pt side padding; the icon and figure share one row, the level bar sits 8 pt below it
+        icon.frame = NSRect(x: 12, y: 20, width: 22, height: 16)
+        label.frame = NSRect(x: 38, y: 20, width: w - 50, height: 16)
         CATransaction.begin(); CATransaction.setDisableActions(true)
-        levelTrack.frame = NSRect(x: 10, y: 5, width: w - 20, height: 3)
-        level.frame = NSRect(x: 10, y: 5, width: (w - 20) * CGFloat(muted ? 0 : v), height: 3)
+        levelTrack.frame = NSRect(x: 12, y: 9, width: w - 24, height: 3)
+        level.frame = NSRect(x: 12, y: 9, width: (w - 24) * CGFloat(muted ? 0 : v), height: 3)
         CATransaction.commit()
         alphaValue = 1
         NSAccessibility.post(element: self, notification: .announcementRequested,
@@ -1593,7 +1686,7 @@ final class VolumeBadge: NSView {
             NSAnimationContext.runAnimationGroup { $0.duration = 0.5; self?.animator().alphaValue = 0 }
         }
         hideWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + (system ? 1.2 : 0.4), execute: work)
     }
 
     /// Gone at once (the speed badge is taking the spot).

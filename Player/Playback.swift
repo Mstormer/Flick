@@ -327,7 +327,7 @@ final class NativePlayback: Playback {
         guard !UserDefaults.standard.bool(forKey: "avplayer"),
               let videos = try? await asset.loadTracks(withMediaType: .video), videos.count == 1, let v = videos.first,
               let audios = try? await asset.loadTracks(withMediaType: .audio), audios.count <= 1,
-              (try? await asset.loadMediaSelectionGroup(for: .legible))?.options.isEmpty ?? true,
+              (try? await asset.loadMediaSelectionGroup(for: .legible))?.embeddedCaptions.isEmpty ?? true,
               let transform = try? await v.load(.preferredTransform), transform.isIdentity,
               let vfmt = try? await v.load(.formatDescriptions).first
         else { return nil }
@@ -593,4 +593,10 @@ final class NativePlayback: Playback {
     private func startEndWatch() {
         endTimer = endWatch(replacing: endTimer, end: { $0.duration }, steer: { $0.sound?.steer(rate: $0.rate) })
     }
+}
+
+extension AVMediaSelectionGroup {
+    /// The caption tracks stored in the file. macOS adds an automatic "Transcribed" option (no media subtype) to every
+    /// asset; counting it sent every file to AVPlayer, whose speed change stalls sound and picture for ~130 ms.
+    var embeddedCaptions: [AVMediaSelectionOption] { options.filter { !$0.mediaSubTypes.isEmpty } }
 }

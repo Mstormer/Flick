@@ -254,7 +254,8 @@ final class HelpWindow: NSWindowController {
                 if let s = i.submenu, !["Services", "Open Recent", "Subtitles"].contains(s.title) { walk(s); continue }
                 guard !i.keyEquivalent.isEmpty, i.action != nil else { continue }
                 text.append(NSAttributedString(string: i.title + "\t", attributes: b))
-                text.append(NSAttributedString(string: label(i) + "\n", attributes: k))
+                text.append(keycaps(label(i), k))
+                text.append(NSAttributedString(string: "\n", attributes: k))
             }
         }
         for top in NSApp.mainMenu?.items ?? [] where top.submenu != nil {
@@ -304,6 +305,22 @@ final class HelpWindow: NSWindowController {
         tv.textColor = nil
         window?.contentView = scroll
         showWindow(nil)
+    }
+
+    /// A shortcut as keycaps: every modifier and the key on a faint plate of its own.
+    private func keycaps(_ label: String, _ attrs: [NSAttributedString.Key: Any]) -> NSAttributedString {
+        let out = NSMutableAttributedString()
+        var parts: [String] = []
+        var rest = Substring(label)
+        while let c = rest.first, "⌃⌥⇧⌘".contains(c) { parts.append(String(c)); rest = rest.dropFirst() }
+        if !rest.isEmpty { parts.append(String(rest)) }
+        var cap = attrs
+        cap[.backgroundColor] = NSColor.quaternaryLabelColor
+        for (n, p) in parts.enumerated() {
+            if n > 0 { out.append(NSAttributedString(string: "\u{2009}", attributes: attrs)) }
+            out.append(NSAttributedString(string: "\u{00A0}" + p + "\u{00A0}", attributes: cap))
+        }
+        return out
     }
 
     /// "⌃⌥⇧⌘" order, as the HIG lists modifiers.
