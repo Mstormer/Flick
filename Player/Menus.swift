@@ -282,8 +282,9 @@ final class HelpWindow: NSWindowController {
         text.append(NSAttributedString(string: "\nOpen-Source Software\n", attributes: h))
         text.append(NSAttributedString(string: "Flick is free software under the GNU General Public License version 3; its source is at "
             + "github.com/Mstormer/Flick. ", attributes: b))
-        text.append(NSAttributedString(string: "WMV, VC-1, MPEG-1/2 (DVD and camcorder video in MKV), WMA, DTS, TrueHD, Vorbis and some VP9 files are decoded with libavformat, "
-            + "libavcodec and libavutil from the FFmpeg project (version 9.0.2, unmodified), licensed under the GNU Lesser "
+        text.append(NSAttributedString(string: "AVI, VOB, MPEG and transport streams, FLV, RealMedia, Ogg, WMV and other formats macOS can't play (DivX, "
+            + "MPEG-1/2, VC-1, DV, Opus, DTS, TrueHD, Vorbis, WMA…), sound-only files, and damaged MP4/MKV files are read and decoded with "
+            + "libavformat, libavcodec, libavutil, libswscale and libswresample from the FFmpeg project (version 9.0.2, unmodified), licensed under the GNU Lesser "
             + "General Public License version 2.1 or later. They are separate libraries inside Flick.app/Contents/Frameworks "
             + "and can be replaced with your own build. ", attributes: b))
         var link: [NSAttributedString.Key: Any] = b
@@ -307,12 +308,7 @@ final class HelpWindow: NSWindowController {
 
     /// "⌃⌥⇧⌘" order, as the HIG lists modifiers.
     private func label(_ i: NSMenuItem) -> String {
-        var s = ""
-        let f = i.keyEquivalentModifierMask
-        if f.contains(.control) { s += "⌃" }
-        if f.contains(.option) { s += "⌥" }
-        if f.contains(.shift) { s += "⇧" }
-        if f.contains(.command) { s += "⌘" }
+        let s = i.keyEquivalentModifierMask.glyphs
         let names: [String: String] = [" ": "Space", MainMenu.key(NSLeftArrowFunctionKey): "←", MainMenu.key(NSRightArrowFunctionKey): "→",
                                        MainMenu.key(NSUpArrowFunctionKey): "↑", MainMenu.key(NSDownArrowFunctionKey): "↓",
                                        MainMenu.key(NSPageUpFunctionKey): "Page Up", MainMenu.key(NSPageDownFunctionKey): "Page Down"]

@@ -54,15 +54,16 @@ struct Shortcut: Codable, Equatable {
 
     var label: String {
         guard !key.isEmpty else { return "" }
-        let f = NSEvent.ModifierFlags(rawValue: modifiers)
-        var s = ""
-        if f.contains(.control) { s += "⌃" }
-        if f.contains(.option) { s += "⌥" }
-        if f.contains(.shift) { s += "⇧" }
-        if f.contains(.command) { s += "⌘" }
-        let names = [" ": "Space", "\u{7f}": "⌫", "\r": "↩", "\t": "⇥",
+        let names = [" ": "Space", "\r": "↩", "\t": "⇥",
                      "\u{f700}": "↑", "\u{f701}": "↓", "\u{f702}": "←", "\u{f703}": "→"]
-        return s + (names[key] ?? key.uppercased())
+        return NSEvent.ModifierFlags(rawValue: modifiers).glyphs + (names[key] ?? key.uppercased())
+    }
+}
+
+extension NSEvent.ModifierFlags {
+    /// "⌃⌥⇧⌘", in the order the HIG lists modifiers (Settings key boxes and Flick Help).
+    var glyphs: String {
+        (contains(.control) ? "⌃" : "") + (contains(.option) ? "⌥" : "") + (contains(.shift) ? "⇧" : "") + (contains(.command) ? "⌘" : "")
     }
 }
 
@@ -174,11 +175,13 @@ final class SettingsWindowController: NSWindowController {
     }
 
     @objc private func addRow() {
+        window?.makeFirstResponder(nil)            // commit a value being typed while its row index still holds
         Shortcuts.shared.items.append(Shortcut(action: .advance, key: "", modifiers: 0, value: ShortcutAction.advance.defaultValue))
         reload()
     }
 
     @objc private func restoreDefaults() {
+        window?.makeFirstResponder(nil)
         Shortcuts.shared.items = Shortcuts.defaults
         reload()
     }
@@ -205,7 +208,7 @@ private final class ShortcutRow: NSStackView {
         actionPopup.target = self; actionPopup.action = #selector(actionChanged)
 
         keyField.onRecord = { [weak self] key, mods in
-            guard let self else { return }
+            guard let self, Shortcuts.shared.items.indices.contains(self.index) else { return }
             var items = Shortcuts.shared.items
             // one key, one action: taking a key moves it off any other row
             for i in items.indices where i != self.index && items[i].key == key && items[i].modifiers == mods && !key.isEmpty {
@@ -250,6 +253,7 @@ private final class ShortcutRow: NSStackView {
     }
 
     @objc private func actionChanged() {
+        guard Shortcuts.shared.items.indices.contains(index) else { return }
         let a = ShortcutAction.allCases[actionPopup.indexOfSelectedItem]
         Shortcuts.shared.items[index].action = a
         Shortcuts.shared.items[index].value = a.defaultValue
@@ -257,11 +261,15 @@ private final class ShortcutRow: NSStackView {
     }
 
     @objc private func valueChanged() {
-        guard Shortcuts.shared.items[index].action.takesValue else { return }
+        // also called when the field stops editing, which can come after its row was removed
+        guard Shortcuts.shared.items.indices.contains(index), Shortcuts.shared.items[index].action.takesValue else { return }
         Shortcuts.shared.items[index].value = max(0.01, valueField.doubleValue)
     }
 
     @objc private func removeRow() {
+        // finish any typing first: ending it later (when reload drops the field) would write into a shifted row
+        window?.makeFirstResponder(nil)
+        guard Shortcuts.shared.items.indices.contains(index) else { return }
         Shortcuts.shared.items.remove(at: index)
         onChange()
     }
@@ -275,6 +283,7 @@ extension ShortcutRow: NSTextFieldDelegate {
 private final class KeyRecorder: NSButton {
     var onRecord: ((String, UInt) -> Void)?
     private var monitor: Any?
+    private var resign: NSObjectProtocol?
     private let shortcut: Shortcut
 
     init(shortcut: Shortcut) {
@@ -290,22 +299,37 @@ private final class KeyRecorder: NSButton {
     required init?(coder: NSCoder) { fatalError() }
 
     @objc private func startRecording() {
+        stop()                                     // a second click must not leave the first monitor behind
         title = "Press a key…"
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
             guard let self else { return e }
             self.stop()
-            if e.keyCode == 53 { self.title = self.shortcut.label.isEmpty ? "—" : self.shortcut.label; return nil }   // Esc
+            if e.keyCode == 53 { self.cancel(); return nil }                                                          // Esc
             if e.keyCode == 51 { self.onRecord?("", 0); return nil }                                                  // ⌫ clears
             let key = e.charactersIgnoringModifiers?.lowercased() ?? ""
             let mods = e.modifierFlags.intersection(Shortcut.relevantFlags).rawValue
             self.onRecord?(key, mods)
             return nil
         }
+        // Closing Settings (or switching to a player) cancels: otherwise the next key pressed anywhere in Flick
+        // would be taken as this shortcut and swallowed.
+        resign = NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: window, queue: .main) { [weak self] _ in
+            self?.stop(); self?.cancel()
+        }
     }
+
+    private func cancel() { title = shortcut.label.isEmpty ? "—" : shortcut.label }
 
     private func stop() {
         if let m = monitor { NSEvent.removeMonitor(m) }
         monitor = nil
+        if let r = resign { NotificationCenter.default.removeObserver(r) }
+        resign = nil
+    }
+
+    override func viewWillMove(toWindow w: NSWindow?) {
+        if w == nil { stop() }
+        super.viewWillMove(toWindow: w)
     }
 
     deinit { stop() }

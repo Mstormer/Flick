@@ -42,7 +42,7 @@ enum CaptionParser {
 
     static func load(_ url: URL) -> CaptionSource? {
         guard let data = try? Data(contentsOf: url) else { return nil }
-        let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .windowsCP1252) ?? ""
+        let text = decode(data)
         let cues: [Cue]
         switch url.pathExtension.lowercased() {
         case "vtt": cues = vtt(text)
@@ -50,11 +50,36 @@ enum CaptionParser {
         default: cues = srt(text)
         }
         guard !cues.isEmpty else { return nil }
-        // "Movie.en.srt" → "en (srt file)"; "Movie.srt" → "Movie.srt"
+        // "Movie.en.srt" → "English — Movie.en.srt"; "Show.S01E01.1080p.srt" → just the file name
         let parts = url.deletingPathExtension().lastPathComponent.split(separator: ".")
-        let lang = parts.count > 1 ? String(parts.last!) : nil
-        let title = lang.map { "\(Locale.current.localizedString(forLanguageCode: $0) ?? $0) — \(url.lastPathComponent)" } ?? url.lastPathComponent
+        let lang = parts.count > 1 ? languageName(String(parts.last!)) : nil
+        let title = lang.map { "\($0) — \(url.lastPathComponent)" } ?? url.lastPathComponent
         return .cues(title: title, cues: cues)
+    }
+
+    /// Text from a subtitle file: a BOM says UTF-32 or UTF-16 (Notepad's "Unicode"), else UTF-8, else Windows-1252.
+    /// UTF-32 is checked first because its little-endian BOM starts with UTF-16's.
+    static func decode(_ data: Data) -> String {
+        let b = [UInt8](data.prefix(4))
+        let boms: [([UInt8], String.Encoding)] = [([0xFF, 0xFE, 0, 0], .utf32LittleEndian), ([0, 0, 0xFE, 0xFF], .utf32BigEndian),
+                                                  ([0xFF, 0xFE], .utf16LittleEndian), ([0xFE, 0xFF], .utf16BigEndian)]
+        if let (bom, enc) = boms.first(where: { b.starts(with: $0.0) }), let s = String(data: data.dropFirst(bom.count), encoding: enc) { return s }
+        return String(data: data, encoding: .utf8) ?? String(data: data, encoding: .windowsCP1252) ?? ""
+    }
+
+    /// The last dot part of a sidecar's name as a language, when it is one ("en", "pt-BR", "zh-Hans", "English");
+    /// release tags like "1080p" or "x264" are not.
+    static func languageName(_ tag: String) -> String? {
+        let p = tag.split(separator: "-", maxSplits: 1).map(String.init)
+        guard let code = p.first, (2...3).contains(code.count), code.allSatisfy(\.isLetter) else {
+            // a language written out: "English", "Français"
+            guard tag.count > 3, tag.allSatisfy(\.isLetter) else { return nil }
+            let named = Locale.LanguageCode.isoLanguageCodes.contains { Locale.current.localizedString(forLanguageCode: $0.identifier)?.caseInsensitiveCompare(tag) == .orderedSame }
+            return named ? tag : nil
+        }
+        guard let name = Locale.current.localizedString(forIdentifier: tag) ?? Locale.current.localizedString(forLanguageCode: code),
+              name.lowercased() != tag.lowercased() else { return nil }
+        return name
     }
 
     /// "00:01:02,345", "01:02.345", "0:01:02.34" → seconds
@@ -77,7 +102,7 @@ enum CaptionParser {
 
     static func srt(_ text: String) -> [Cue] {
         var cues: [Cue] = []
-        for block in text.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n\n") {
+        for block in blocks(text) {
             let lines = block.split(separator: "\n", omittingEmptySubsequences: false)
             guard let i = lines.firstIndex(where: { $0.contains("-->") }) else { continue }
             let ends = lines[i].components(separatedBy: "-->")
@@ -89,9 +114,17 @@ enum CaptionParser {
         return cues.sorted { $0.start < $1.start }
     }
 
+    /// Cue blocks: separated by lines that are empty or only spaces (many SRTs leave a space or tab there,
+    /// which would otherwise glue the next cue, numbers and timing included, onto this one's text).
+    static func blocks(_ text: String) -> [String] {
+        text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+            .replacingOccurrences(of: "\n[ \t\u{00A0}]*\n", with: "\n\n", options: .regularExpression)
+            .components(separatedBy: "\n\n")
+    }
+
     static func vtt(_ text: String) -> [Cue] {
         // Same cue layout as SRT once headers, NOTE/STYLE/REGION blocks and cue settings are ignored.
-        srt(text.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n\n")
+        srt(blocks(text.hasPrefix("\u{FEFF}") ? String(text.dropFirst()) : text)
             .filter { b in !["WEBVTT", "NOTE", "STYLE", "REGION"].contains { b.hasPrefix($0) } }
             .joined(separator: "\n\n"))
     }
@@ -102,7 +135,8 @@ enum CaptionParser {
         for raw in text.components(separatedBy: .newlines) {
             let line = raw.trimmingCharacters(in: .whitespaces)
             if line.hasPrefix("Format:") && cues.isEmpty {
-                fields = line.dropFirst(7).split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+                let f = line.dropFirst(7).split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+                if !f.isEmpty { fields = f }               // an empty Format line keeps the standard fields
             } else if line.hasPrefix("Dialogue:") {
                 let v = line.dropFirst(9).split(separator: ",", maxSplits: fields.count - 1, omittingEmptySubsequences: false)
                 guard v.count == fields.count, let si = fields.firstIndex(of: "Start"), let ei = fields.firstIndex(of: "End"),
@@ -111,7 +145,7 @@ enum CaptionParser {
                 if !body.isEmpty { cues.append(Cue(start: a, end: b, text: body)) }
             }
         }
-        return mergeOverlaps(cues.sorted { $0.start < $1.start })
+        return cues.sorted { $0.start < $1.start }
     }
 
     /// Matroska text tracks: each block is one cue (S_TEXT/UTF8 = SRT text, S_TEXT/ASS = a Dialogue line without the timing).
@@ -137,11 +171,8 @@ enum CaptionParser {
                                      : (i + 1 < pk.count ? mkv.seconds(pk[i + 1].pts) : start + 4)
             if !body.isEmpty { cues.append(Cue(start: start, end: end, text: body)) }
         }
-        return .cues(title: name, cues: mergeOverlaps(cues.sorted { $0.start < $1.start }))
+        return .cues(title: name, cues: cues.sorted { $0.start < $1.start })
     }
-
-    /// Overlapping cues (common in ASS) are shown together.
-    static func mergeOverlaps(_ cues: [Cue]) -> [Cue] { cues }
 }
 
 // MARK: - Rendering
@@ -152,6 +183,7 @@ final class CaptionOverlay: NSView {
     private let label = NSTextField(wrappingLabelWithString: "")
     private let backdrop = NSView()
     private var cues: [Cue] = []
+    private var reach: [Double] = []                 // reach[i]: the latest end of cues[0...i], so the scan back knows when to stop
     private var shown = ""
     private var textBackground: NSColor?
 
@@ -176,7 +208,12 @@ final class CaptionOverlay: NSView {
 
     override func hitTest(_ point: NSPoint) -> NSView? { nil }   // never steals clicks from the player
 
-    func set(_ c: [Cue]) { cues = c; shown = "\u{0}"; isHidden = c.isEmpty }
+    func set(_ c: [Cue]) {
+        cues = c
+        var m = -Double.infinity
+        reach = c.map { m = max(m, $0.end); return m }
+        shown = "\u{0}"; isHidden = c.isEmpty
+    }
 
     @objc private func styleChanged() { applyStyle(); shown = "\u{0}" }
 
@@ -212,8 +249,11 @@ final class CaptionOverlay: NSView {
         var lo = 0, hi = cues.count
         while lo < hi { let m = (lo + hi) / 2; if cues[m].start <= t { lo = m + 1 } else { hi = m } }
         var active: [String] = []
+        // Overlapping cues (common in ASS) show together. Walk back only while some earlier cue still lasts
+        // past t: a long sign under many short lines stays up, and a normal tick looks at one or two cues.
+        // The 512-cue bound only matters for a cue lasting most of the film (a watermark) and keeps a tick cheap.
         var i = lo - 1
-        while i >= 0 && i >= lo - 8 { if cues[i].end > t { active.insert(cues[i].text, at: 0) }; i -= 1 }
+        while i >= 0 && i >= lo - 512 && reach[i] > t { if cues[i].end > t { active.insert(cues[i].text, at: 0) }; i -= 1 }
         let text = active.joined(separator: "\n")
         guard text != shown else { return }
         shown = text

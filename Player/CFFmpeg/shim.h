@@ -4,6 +4,7 @@
 #include <libavutil/avutil.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/pixdesc.h>
+#include <libswscale/swscale.h>
 
 static inline int ff_eagain(void) { return AVERROR(EAGAIN); }
 static inline int ff_eof(void) { return AVERROR_EOF; }

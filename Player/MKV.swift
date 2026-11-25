@@ -77,6 +77,10 @@ final class MKVFile {
     var audioTracks: [Track] { tracks.filter { $0.type == 2 } }
 
     func seconds(_ ts: Int64) -> Double { Double(ts) * Double(timecodeScale) / 1e9 }
+    /// The track's stated frame duration in timestamp units, 0 when it states none.
+    func frameStep(_ t: Track) -> Int64 {
+        t.defaultDuration > 0 ? Int64(min(1e15, (Double(t.defaultDuration) / Double(timecodeScale)).rounded())) : 0
+    }
 
     // MARK: EBML primitives
 
@@ -159,16 +163,16 @@ final class MKVFile {
             guard let id = readID(&o), let sz = readSize(&o) else { break }
             switch id {
             case 0x1549A966: // Info
-                let end = min(segEnd, o + Int(sz))
+                let end = sz < 0 ? segEnd : min(segEnd, o + Int(sz))
                 var dur = 0.0
                 children(o, end) { cid, co, cn in
-                    if cid == 0x2AD7B1 { self.timecodeScale = self.uint(co, cn) }
+                    if cid == 0x2AD7B1 { let s = self.uint(co, cn); if s > 0 && s <= 1_000_000_000 { self.timecodeScale = s } }   // 0 or absurd: keep 1 ms
                     if cid == 0x4489 { dur = self.float(co, cn) }
                 }
                 duration = dur * Double(timecodeScale) / 1e9
                 o = end
             case 0x1654AE6B: // Tracks
-                let end = min(segEnd, o + Int(sz))
+                let end = sz < 0 ? segEnd : min(segEnd, o + Int(sz))
                 children(o, end) { cid, co, cn in if cid == 0xAE { self.parseTrack(co, co + cn) } }
                 o = end
             case 0x1F43B675: // Cluster
@@ -274,18 +278,19 @@ final class MKVFile {
 
     private func block(_ start: Int, _ n: Int, clusterTime: Int64, simple: Bool, refs: Bool, duration: Int64) {
         var o = start
-        guard let tn = readSize(&o), o + 3 <= start + n, packets[Int(tn)] != nil else { return }
+        // every number below comes from the file: nothing here may trap on a damaged or hostile one
+        guard n <= Int(Int32.max), let tn = readSize(&o), o + 3 <= start + n, packets[Int(tn)] != nil else { return }
         let rel = Int16(bitPattern: UInt16(base[o]) << 8 | UInt16(base[o + 1]))
         let flags = base[o + 2]
         o += 3
-        let pts = clusterTime + Int64(rel)
+        let pts = clusterTime &+ Int64(rel)
         let key = simple ? flags & 0x80 != 0 : !refs
         let disc = simple && flags & 0x01 != 0
         let end = start + n
         let track = Int(tn)
         let lacing = (flags >> 1) & 3
         if lacing == 0 {
-            packets[track]?.append(Packet(pts: pts, offset: Int64(o), size: Int32(end - o), keyframe: key, discardable: disc, duration: Int32(duration)))
+            packets[track]?.append(Packet(pts: pts, offset: Int64(o), size: Int32(end - o), keyframe: key, discardable: disc, duration: Int32(clamping: max(0, duration))))
             return
         }
         // Laced frames (audio): split, and give each its own timestamp from the track's frame duration.
@@ -301,14 +306,16 @@ final class MKVFile {
                 sizes.append(s)
             }
         case 3: // EBML
-            guard let first = readSize(&o) else { return }
+            guard count > 1, let first = readSize(&o), first >= 0, first <= end - o else { return }
             sizes.append(Int(first))
-            for _ in 1..<(count - 1) {
+            for _ in 1..<max(1, count - 1) {
                 let p0 = o
-                guard let raw = readSize(&o) else { return }
+                guard let raw = readSize(&o), raw >= 0 else { return }
                 let len = o - p0
                 let bias = (Int64(1) << (7 * len - 1)) - 1
-                sizes.append(sizes.last! + Int(raw - bias))
+                let s = sizes.last! + Int(raw - bias)
+                guard s >= 0, s <= end - o else { return }
+                sizes.append(s)
             }
         default: // fixed
             let each = (end - o) / count
@@ -316,10 +323,9 @@ final class MKVFile {
         }
         let used = sizes.reduce(0, +)
         sizes.append(end - o - used)
-        let ns = tracks.first { $0.number == track }?.defaultDuration ?? 0
-        let step = ns > 0 ? Int64((Double(ns) / Double(timecodeScale)).rounded()) : 0
+        let step = tracks.first { $0.number == track }.map(frameStep) ?? 0
         for (i, s) in sizes.enumerated() where s > 0 && o + s <= end {
-            packets[track]?.append(Packet(pts: pts + Int64(i) * step, offset: Int64(o), size: Int32(s), keyframe: key, discardable: disc, duration: Int32(step)))
+            packets[track]?.append(Packet(pts: pts &+ Int64(i) &* step, offset: Int64(o), size: Int32(s), keyframe: key, discardable: disc, duration: Int32(clamping: step)))
             o += s
         }
     }

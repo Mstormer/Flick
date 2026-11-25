@@ -198,3 +198,44 @@ enum MKVCodecs {
         return Data([0, 0, 0, 0]) + blocks
     }
 }
+
+/// A block buffer over `n` bytes of a mapped file, not copied (whoever holds the mapping outlives the buffer).
+func mappedBlock(_ p: UnsafeRawPointer, _ n: Int) -> CMBlockBuffer? {
+    var block: CMBlockBuffer?
+    guard CMBlockBufferCreateWithMemoryBlock(allocator: nil, memoryBlock: UnsafeMutableRawPointer(mutating: p), blockLength: n,
+                                             blockAllocator: kCFAllocatorNull, customBlockSource: nil, offsetToData: 0,
+                                             dataLength: n, flags: 0, blockBufferOut: &block) == noErr else { return nil }
+    return block
+}
+
+/// How SDR pictures meet the display. Tagged BT.709 (or untagged), macOS converts the camera curve
+/// scene-referred, which lifts shadows and mid-tones: video looks washed out next to IINA/mpv and VLC, which
+/// put the encoded values on the display's own curve. Retagged, macOS does the same (measured with a grey
+/// ramp: within 1 level of mpv on average, Bench/colortest). HDR (PQ, HLG) and unusual tags stay as they are.
+/// Each path honours a different tag: software pictures the sRGB curve, VideoToolbox's a plain gamma.
+enum DisplayTone {
+    private static let sdr: Set<String> = [kCVImageBufferTransferFunction_ITU_R_709_2 as String,
+                                           kCVImageBufferTransferFunction_SMPTE_240M_1995 as String,
+                                           kCVImageBufferTransferFunction_ITU_R_2020 as String]
+
+    /// The stream's description for VideoToolbox: its pictures carry the description's colour tags, so
+    /// playback and scrubbing both come out right.
+    static func format(_ f: CMVideoFormatDescription) -> CMVideoFormatDescription {
+        if let t = CMFormatDescriptionGetExtension(f, extensionKey: kCMFormatDescriptionExtension_TransferFunction) as? String,
+           !sdr.contains(t) { return f }
+        var ext = (CMFormatDescriptionGetExtensions(f) as? [CFString: Any]) ?? [:]
+        ext[kCMFormatDescriptionExtension_TransferFunction] = kCVImageBufferTransferFunction_UseGamma
+        ext[kCMFormatDescriptionExtension_GammaLevel] = 2.2
+        var out: CMVideoFormatDescription?
+        let d = CMVideoFormatDescriptionGetDimensions(f)
+        guard CMVideoFormatDescriptionCreate(allocator: nil, codecType: CMFormatDescriptionGetMediaSubType(f), width: d.width, height: d.height,
+                                             extensions: ext as CFDictionary, formatDescriptionOut: &out) == noErr, let out else { return f }
+        return out
+    }
+
+    /// A picture FFmpeg decoded (tagged by FFPlayback just before).
+    static func apply(_ px: CVImageBuffer) {
+        if let t = CVBufferCopyAttachment(px, kCVImageBufferTransferFunctionKey, nil) as? String, !sdr.contains(t) { return }
+        CVBufferSetAttachment(px, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_sRGB, .shouldPropagate)
+    }
+}

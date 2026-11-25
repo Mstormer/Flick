@@ -16,6 +16,8 @@ protocol Playback: AnyObject {
     func seek(to seconds: Double, completion: @escaping (Bool) -> Void)
     func cancelSeeks()
     func teardown()
+    /// Called on main when the video reaches its end.
+    var onEnd: (() -> Void)? { get set }
     /// Release the video decoder while paused (it holds ~190 MB of 4K frame buffers). The next seek or
     /// play rebuilds it; the caller keeps the current picture on screen meanwhile.
     func suspend()
@@ -34,12 +36,23 @@ final class AVPlayerPlayback: Playback {
     var legibleGroup: AVMediaSelectionGroup?
     private var savedLegible: AVMediaSelectionOption?
     var layer: CALayer { playerLayer }
+    var onEnd: (() -> Void)?
+    private var endObserver: NSObjectProtocol?
+
+    private func makeItem() -> AVPlayerItem {
+        let item = AVPlayerItem(asset: asset)
+        item.audioTimePitchAlgorithm = .timeDomain
+        return item
+    }
 
     init(asset: AVURLAsset) {
         self.asset = asset
-        let item = AVPlayerItem(asset: asset)
-        item.audioTimePitchAlgorithm = .timeDomain
-        player.replaceCurrentItem(with: item)
+        player.replaceCurrentItem(with: makeItem())
+        // any item: a suspend and revive swaps in a fresh one
+        endObserver = NotificationCenter.default.addObserver(forName: AVPlayerItem.didPlayToEndTimeNotification, object: nil, queue: .main) { [weak self] n in
+            guard let self, (n.object as? AVPlayerItem) === self.player.currentItem else { return }
+            self.onEnd?()
+        }
         player.actionAtItemEnd = .pause
         playerLayer.player = player
         playerLayer.videoGravity = .resizeAspect
@@ -59,8 +72,7 @@ final class AVPlayerPlayback: Playback {
 
     private func revive() {
         guard isSuspended else { return }
-        let item = AVPlayerItem(asset: asset)
-        item.audioTimePitchAlgorithm = .timeDomain
+        let item = makeItem()
         if let g = legibleGroup { item.select(savedLegible, in: g) }
         player.replaceCurrentItem(with: item)
         isSuspended = false
@@ -99,7 +111,11 @@ final class AVPlayerPlayback: Playback {
         if item.status != .unknown { fire() }          // became ready (or failed) before the observer was in place
     }
     func cancelSeeks() { player.currentItem?.cancelPendingSeeks() }
-    func teardown() { player.pause() }
+    func teardown() {
+        player.pause()
+        if let o = endObserver { NotificationCenter.default.removeObserver(o); endObserver = nil }
+    }
+    deinit { if let o = endObserver { NotificationCenter.default.removeObserver(o) } }
 }
 
 // MARK: - Native (Matroska)
@@ -156,11 +172,7 @@ final class MKVAudio: AudioSource {
     }
 
     private func buffer(_ p: MKVFile.Packet) -> CMSampleBuffer? {
-        var block: CMBlockBuffer?
-        guard CMBlockBufferCreateWithMemoryBlock(allocator: nil, memoryBlock: UnsafeMutableRawPointer(mutating: mkv.base + Int(p.offset)),
-                                                 blockLength: Int(p.size), blockAllocator: kCFAllocatorNull, customBlockSource: nil,
-                                                 offsetToData: 0, dataLength: Int(p.size), flags: 0, blockBufferOut: &block) == noErr,
-              let block else { return nil }
+        guard let block = mappedBlock(mkv.base + Int(p.offset), Int(p.size)) else { return nil }
         let t = CMTime(seconds: Double(p.pts) * tscale, preferredTimescale: 48000)
         var sb: CMSampleBuffer?
         if isPCM {
@@ -260,6 +272,10 @@ final class NativePlayback: Playback {
     private var rate: Float = 1
     let duration: Double
     var onEnd: (() -> Void)?
+    /// The hardware decoder turned down a run of frames (damaged data): it shows nothing more until the next
+    /// keyframe, so the player hands the file to FFmpeg, which conceals the damage. Called once, on main.
+    var onDamaged: (() -> Void)?
+    private var badFrames = 0
     // Video is decoded here rather than inside the display layer, so only a few frames are ever queued
     // (the layer decodes up to a second ahead: ~280 MB of 4K pictures). Everything below is on q.
     private var session: VTDecompressionSession?
@@ -375,11 +391,17 @@ final class NativePlayback: Playback {
             return
         }
         rate = r
-        if currentSeconds >= duration - 0.05 { seek(to: 0) { _ in } }
+        let atEnd = currentSeconds >= duration - 0.05
         isPlaying = true
         startEndWatch()
-        if sound == nil { sync.setRate(r, time: sync.currentTime()) }
-        q.async { [self] in sound?.play(rate: r); pump(gen) }     // after any reset queued by a seek
+        // from the end: back to the start, and that seek starts the clock and the sound once its picture is up
+        if atEnd { seek(to: 0) { _ in }; return }
+        // on q, so after any reset queued by a seek (which stops the clock): started here on main, a silent
+        // video's clock was stopped again by that reset and stayed at rate 0 while "playing"
+        q.async { [self] in
+            if let sound { sound.play(rate: r) } else if isPlaying { sync.setRate(r, time: sync.currentTime()) }
+            pump(gen)
+        }
     }
 
     func pause() {
@@ -479,24 +501,12 @@ final class NativePlayback: Playback {
         sessionBroken = false
     }
 
-    private func makeSession() -> VTDecompressionSession? {
-        let spec = [kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: true] as CFDictionary
-        let attrs = [kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
-                     kCVPixelBufferMetalCompatibilityKey: true] as CFDictionary
-        var s: VTDecompressionSession?
-        guard VTDecompressionSessionCreate(allocator: nil, formatDescription: index.format, decoderSpecification: spec,
-                                           imageBufferAttributes: attrs, outputCallback: nil,
-                                           decompressionSessionOut: &s) == noErr, let s else { return nil }
-        VTSessionSetProperty(s, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-        return s
-    }
-
     /// Keep `lead` pictures decoded ahead of the clock. Frames before an exact-seek target are decoded for
     /// their references only (and skipped entirely when nothing references them).
     private func pump(_ g: Int, timer: Bool = false) {
         if timer { pumpPending = false }
         guard g == gen, !isSuspended else { return }
-        if session == nil { session = makeSession() }
+        if session == nil { session = index.makeSession(realTime: true) }
         guard let s = session else { return }
         let now = Int64((sync.currentTime().seconds * Double(index.timescale)).rounded(.down))
         queued.removeAll { $0 <= now }
@@ -513,7 +523,7 @@ final class NativePlayback: Playback {
                                                        infoFlagsOut: nil) { [weak self] status, _, image, t, _ in
                 self?.q.async { self?.decoded(g, fed, status, image, t) }
             }
-            if st != noErr { inflight -= 1; sessionBroken = true; outstanding.removeLast() }
+            if st != noErr { inflight -= 1; sessionBroken = true; outstanding.removeLast(); Trace.log("submit error \(st) at \(fed)") }
         }
         if vNext >= index.samples.count { VTDecompressionSessionFinishDelayedFrames(s) }
         // playing: come back once about half the queue has been shown
@@ -529,7 +539,14 @@ final class NativePlayback: Playback {
         guard g == gen else { return }
         inflight = max(0, inflight - 1)
         if let i = outstanding.firstIndex(of: fed) { outstanding.remove(at: i) }
-        if status != noErr { sessionBroken = true }
+        if status != noErr {
+            sessionBroken = true
+            Trace.log("decode error \(status) at \(fed)")
+            // frames before a seek target can fail for want of references (open-GOP leading pictures): not damage
+            if fed >= hideBefore { badFrames += 1 }
+            if badFrames == 3, let f = onDamaged { DispatchQueue.main.async(execute: f) }
+        }
+        if status == noErr { badFrames = 0 }               // a run of failures is damage; one bad frame now and then isn't
         if status == noErr, let image, fed >= hideBefore {
             let at = reorder.firstIndex { $0.pts > fed } ?? reorder.count
             reorder.insert((fed, t, image), at: at)
@@ -574,17 +591,6 @@ final class NativePlayback: Playback {
     }
 
     private func startEndWatch() {
-        endTimer?.invalidate()
-        defer { endTimer?.tolerance = 0.1 }
-        endTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            guard let self, self.isPlaying else { return }
-            Trace.log(String(format: "native t=%.2f video=%d vNext=%d", self.currentSeconds,
-                             self.display.sampleBufferRenderer.status.rawValue, self.vNext))
-            self.sound?.steer(rate: self.rate)
-            if self.currentSeconds >= self.duration - 0.02 {
-                self.pause()
-                self.onEnd?()
-            }
-        }
+        endTimer = endWatch(replacing: endTimer, end: { $0.duration }, steer: { $0.sound?.steer(rate: $0.rate) })
     }
 }

@@ -20,8 +20,8 @@ FFmpeg
 This software uses code of FFmpeg (https://ffmpeg.org) licensed under the
 GNU Lesser General Public License version 2.1 or later (LGPL v2.1+).
 
-  Libraries:      libavformat, libavcodec, libavutil, FFmpeg version 9.0.2,
-                  unmodified. Built as LGPL: no GPL, version-3 or nonfree parts.
+  Libraries:      libavformat, libavcodec, libavutil, libswscale and
+                  libswresample, FFmpeg version 9.0.2, unmodified. Built as LGPL: no GPL, version-3 or nonfree parts.
   Location:       Flick.app/Contents/Frameworks/ (separate dynamic libraries)
   Source code:    ffmpeg-9.0.2.tar.xz, attached to the Flick release that this
                   copy came from, and at https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz

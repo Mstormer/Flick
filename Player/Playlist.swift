@@ -4,13 +4,28 @@ import UniformTypeIdentifiers
 /// The videos a window plays through: dropped or opened files, with folders expanded (recursively, in
 /// Finder's name order).
 enum Playlist {
-    /// Containers Flick plays beyond what macOS declares as movies.
-    static let extraExtensions: Set<String> = ["mkv", "webm", "wmv", "asf", "vob", "mpg", "mpeg", "m2v", "mts", "m2ts"]
+    /// Containers Flick plays beyond what macOS declares as movies or audio (on a Mac without other players).
+    static let extraExtensions: Set<String> = [
+        "mkv", "mk3d", "mka", "webm", "wmv", "wma", "asf", "avi", "divx", "xvid", "vob", "mpg", "mpeg", "m1v", "m2v", "mpv",
+        "ts", "m2t", "tp", "trp", "mts", "m2ts", "ogv", "ogg", "oga", "ogm", "opus", "spx", "flv", "f4v", "rm", "rmvb", "ra",
+        "mxf", "nut", "ivf", "y4m", "wtv", "dv", "dif", "3gp", "3g2", "mjpg", "mjpeg", "h264", "264", "h265", "265", "hevc",
+        "flac", "ape", "wv", "tta", "mpc", "tak", "dts", "dtshd", "ac3", "eac3", "thd", "mlp", "dsf", "w64", "voc", "amr",
+        "shn", "xwma", "au", "snd", "caf", "aif", "aiff", "wav", "mp2", "mp3", "m4a", "aac"]
 
+    /// Anything Flick opens: video, and sound on its own.
     static func isVideo(_ url: URL) -> Bool {
         if extraExtensions.contains(url.pathExtension.lowercased()) { return true }
         guard let t = (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType ?? UTType(filenameExtension: url.pathExtension) else { return false }
-        return t.conforms(to: .movie) || t.conforms(to: .video)
+        return t.conforms(to: .audiovisualContent)
+    }
+
+    /// A regular file, or a symlink to one (resource values describe the link itself, so it is followed here;
+    /// symlinked folders are still not entered, which keeps link loops out).
+    private static func isFile(_ f: URL) -> Bool {
+        guard let v = try? f.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) else { return false }
+        if v.isRegularFile == true { return true }
+        guard v.isSymbolicLink == true else { return false }
+        return (try? f.resolvingSymlinksInPath().resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true
     }
 
     /// Files as given (in the given order); each folder becomes its videos, sorted like Finder.
@@ -20,10 +35,10 @@ enum Playlist {
             var isDir: ObjCBool = false
             guard FileManager.default.fileExists(atPath: u.path, isDirectory: &isDir) else { continue }
             if !isDir.boolValue { out.append(u); continue }
-            guard let e = FileManager.default.enumerator(at: u, includingPropertiesForKeys: [.isRegularFileKey, .contentTypeKey],
+            guard let e = FileManager.default.enumerator(at: u, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .contentTypeKey],
                                                          options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { continue }
             var found: [URL] = []
-            for case let f as URL in e where (try? f.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true && isVideo(f) {
+            for case let f as URL in e where isFile(f) && (isVideo(f) || isVideo(f.resolvingSymlinksInPath())) {
                 found.append(f)
             }
             out += found.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
@@ -32,7 +47,7 @@ enum Playlist {
     }
 }
 
-/// The list of videos (right side): one row each, the playing one selected. Clicking a row plays it; the
+/// The list of videos (left side): one row each, the playing one selected. Clicking a row plays it; the
 /// arrow keys stay with the player, so the list never takes keyboard focus.
 final class PlaylistPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     private let effect = NSVisualEffectView()

@@ -22,3 +22,5 @@ Bench/settingstest/settingstest
 Bench/uitest/uitest
 *.dSYM/
 Vendor/
+Bench/opentest/opentest
+Bench/colortest/colortest

@@ -35,7 +35,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !items.isEmpty else { return }
         openedAny = true
         urls.forEach { NSDocumentController.shared.noteNewRecentDocumentURL($0) }
-        let wc = PlayerWindowController(urls: items)
+        present(PlayerWindowController(urls: items))
+    }
+
+    private func present(_ wc: PlayerWindowController) {
         windows.append(wc)
         wc.onClose = { [weak self, weak wc] in self?.windows.removeAll { $0 === wc } }
         wc.showWindow(nil)
@@ -58,10 +61,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             existing.window?.makeKeyAndOrderFront(nil)
             return
         }
-        let wc = PlayerWindowController(url: url)
-        windows.append(wc)
-        wc.onClose = { [weak self, weak wc] in self?.windows.removeAll { $0 === wc } }
-        wc.showWindow(nil)
+        present(PlayerWindowController(url: url))
     }
 
     @objc func showSettings() {
@@ -73,7 +73,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func openDocument(_ sender: Any?) {
         let p = NSOpenPanel()
-        p.allowedContentTypes = [.movie, .video, .audiovisualContent]
+        p.allowedContentTypes = [.audiovisualContent] + Playlist.extraExtensions.sorted().compactMap { UTType(filenameExtension: $0) }
         p.allowsOtherFileTypes = true
         p.allowsMultipleSelection = true
         p.canChooseDirectories = true
@@ -247,6 +247,7 @@ final class PlayerHost: NSView {
 final class PlayerView: NSView {
     private(set) var backend: Playback?
     private let videoHost = CALayer()          // the backend's own layer goes in here
+    private let soundArt = CALayer()           // a waveform symbol in place of the picture, for sound-only files
     private let scrubLayer = AVSampleBufferDisplayLayer()
     private let controls = ControlBar()
     private let hud = BadgeLabel()
@@ -265,7 +266,6 @@ final class PlayerView: NSView {
     /// Chosen in the playlist while paused: shown as black with its name, opened only when Play is pressed,
     /// so arrowing through a list doesn't open every file on the way.
     private var pendingURL: URL?
-    private var endObserver: NSObjectProtocol?
 
     // the window's playlist (PlayerWindowController owns it)
     var onSwitch: ((Int) -> Void)?
@@ -286,8 +286,8 @@ final class PlayerView: NSView {
     /// Playing, or about to (still opening, or mid-seek with play to resume).
     var isPlayingNow: Bool {
         guard pendingURL == nil else { return false }
-        guard let backend else { return loadedURL != nil }
-        return target != nil ? resumeAfterSeek : backend.isPlaying
+        guard backend != nil else { return loadedURL != nil && !openFailed }
+        return playingOrResuming
     }
 
     /// Stand in for `url` without opening it: black, its name, and the info panel if that's open.
@@ -303,12 +303,17 @@ final class PlayerView: NSView {
 
     private var engine: ScrubEngine?
     private var index: MediaIndex?
-    private var duration: Double = 0
+    private(set) var duration: Double = 0
     private var clock: Timer?
 
     // seeking state
     private var target: Int?                  // engine frame we're heading to (nil = follow the player)
     private var resumeAfterSeek = false
+    private var switchingToSoftware = false
+    /// Set by teardown(): whatever is still opening in the background must not start playing afterwards.
+    private var tornDown = false
+    /// Nothing here could open the file (empty, not a media file, or too damaged); the window says so.
+    private(set) var openFailed = false
     private var settleWork: DispatchWorkItem?
     private var settleGen = 0
     private var dragging = false
@@ -375,6 +380,7 @@ final class PlayerView: NSView {
         CATransaction.begin(); CATransaction.setDisableActions(true)
         videoHost.frame = bounds
         backend?.layer.frame = videoHost.bounds
+        soundArt.frame = videoHost.bounds
         scrubLayer.frame = bounds
         CATransaction.commit()
         controls.frame = NSRect(x: 0, y: 0, width: bounds.width, height: 64)
@@ -397,22 +403,19 @@ final class PlayerView: NSView {
             let asset = AVURLAsset(url: url)
             var newIndex: MediaIndex?
             var playAsset: AVURLAsset?
-            if (try? await asset.load(.isPlayable)) == true {
+            // AVFoundation plays MPEG program/transport streams too, but its pictures can't be retagged (they
+            // look washed out, see DisplayTone): with video they go to FFmpeg; sound alone stays here
+            let hasVideo = (try? await asset.loadTracks(withMediaType: .video))?.isEmpty == false
+            let streamVideo = hasVideo && !MediaIndex.readsSamplesDirectly(url)
+            if !streamVideo, (try? await asset.load(.isPlayable)) == true {
                 playAsset = asset
                 if let (native, idx) = await NativePlayback.make(asset: asset) {
                     // decodes only a few frames ahead: about 100 MB less than AVPlayer for 4K
-                    native.onEnd = { [weak self] in self?.controls.setTime(self?.duration ?? 0, playing: false); self?.finished() }
-                    backend = native
+                    adopt(native, index: idx, url)
                     newIndex = idx
-                    duration = idx.duration
                 } else {
-                    let av = AVPlayerPlayback(asset: asset)
-                    backend = av
+                    adopt(AVPlayerPlayback(asset: asset))
                     duration = (try? await asset.load(.duration).seconds) ?? 0
-                    endObserver = NotificationCenter.default.addObserver(forName: AVPlayerItem.didPlayToEndTimeNotification, object: nil, queue: .main) { [weak self, weak av] n in
-                        guard let av, (n.object as? AVPlayerItem) === av.player.currentItem else { return }
-                        self?.finished()
-                    }
                 }
                 size = (try? await asset.loadTracks(withMediaType: .video).first?.load(.naturalSize)) ?? .zero
             } else if let (mkv, idx) = await Task.detached(operation: { () -> (MKVFile, MediaIndex?)? in
@@ -425,16 +428,13 @@ final class PlayerView: NSView {
                       }).value, let idx {
                 let native = NativePlayback(mkv: mkv, index: idx)
                 mkv.dropPlaybackPackets()
-                native.onEnd = { [weak self] in self?.controls.setTime(self?.duration ?? 0, playing: false); self?.finished() }
-                backend = native
+                adopt(native, index: idx, url)
                 newIndex = idx
                 self.mkv = mkv
-                duration = idx.duration
                 let v = mkv.video!
                 size = CGSize(width: v.displayWidth > 0 ? v.displayWidth : v.width, height: v.displayHeight > 0 ? v.displayHeight : v.height)
-            } else {
-                // WMV, VC-1, VP9 the hardware decoder refuses…: decoded in software by the bundled FFmpeg
-                guard let (mkv, v, a) = await Task.detached(operation: { () -> (MKVFile?, FFVideo, AudioSource?)? in
+            } else if let (mkv, v, a) = await Task.detached(operation: { () -> (MKVFile?, FFVideo, AudioSource?)? in
+                          // WMV, VC-1, VP9 the hardware decoder refuses, AVI, VOB…: decoded in software by the bundled FFmpeg.
                           // Matroska: when FFmpeg decodes all of it, it reads the file as it plays (instant, even on a
                           // network share); otherwise the packet table is read for the system's audio decoders.
                           let head = MKVFile(url: url, headerOnly: true)
@@ -442,17 +442,22 @@ final class PlayerView: NSView {
                           let mkv = lazy ? head : MKVFile(url: url)
                           guard let (v, a) = FFPlayback.open(url, audio: lazy ? nil : mkv.flatMap(MKVCodecs.audioSource)) else { return nil }
                           return (mkv, v, a)
-                      }).value
-                else { flash(status, "Can't open this file"); return }
+                      }).value {
                 mkv?.dropPlaybackPackets()
                 let ff = FFPlayback(video: v, audio: a)
-                ff.onEnd = { [weak self] in self?.controls.setTime(self?.duration ?? 0, playing: false); self?.finished() }
-                backend = ff
+                adopt(ff)
                 self.mkv = mkv
                 duration = ff.duration
                 size = ff.displaySize
                 previewSource = FFThumbnailer(url: url)
-            }
+            } else if let (d, a) = await Task.detached(operation: { FFAudioPlayback.open(url) }).value,
+                      let snd = FFAudioPlayback(demux: d, audio: a) {
+                // no pictures (Opus, Ogg Vorbis, APE…, or video nothing here decodes): the sound alone
+                adopt(snd)
+                duration = snd.duration
+            } else { openFailed = true; flash(status, "Can't open this file", hold: true); return }
+            // closed, or moved on to another video, while this one was opening: it must not start playing
+            if tornDown { backend?.teardown(); return }
             guard let backend else { return }
             if let s = startSound { backend.volume = s.volume; backend.isMuted = s.muted }
             if Self.startMuted { backend.isMuted = true }
@@ -464,6 +469,7 @@ final class PlayerView: NSView {
             CATransaction.begin(); CATransaction.setDisableActions(true)
             backend.layer.frame = videoHost.bounds
             videoHost.addSublayer(backend.layer)
+            if size.width == 0 { showSoundArt() }
             CATransaction.commit()
             if size.width > 0 {
                 window?.contentAspectRatio = size
@@ -494,19 +500,44 @@ final class PlayerView: NSView {
             // Build the frame index off the main thread; until it lands, seeks go straight to the backend.
             await loadCaptions(from: url, asset: playAsset)
             if newIndex == nil, let playAsset { newIndex = await MediaIndex(asset: playAsset) }
-            if ProcessInfo.processInfo.environment["FLICK_NO_ENGINE"] != nil { return }   // diagnostics only
+            if tornDown || ProcessInfo.processInfo.environment["FLICK_NO_ENGINE"] != nil { return }   // (the variable: diagnostics only)
             if let idx = newIndex, let eng = ScrubEngine(index: idx) {
                 eng.onFrame = { [weak self] px, d, exact in
                     self?.display(px)
                     if exact { DispatchQueue.main.async { self?.engineReached(d) } }
                 }
                 eng.onFail = { [weak self] d in DispatchQueue.main.async { self?.engineFailed(d) } }
-                eng.setIdle(!backend.isPlaying)
+                eng.setIdle(!(self.backend ?? backend).isPlaying)      // damaged frames may have swapped players meanwhile
                 index = idx
                 engine = eng
                 previewSource = Thumbnailer(index: idx)
             }
         }
+    }
+
+    /// `b` plays this view's video from now on; its end goes to the controls and the playlist.
+    private func adopt(_ b: Playback) {
+        b.onEnd = { [weak self] in self?.controls.setTime(self?.duration ?? 0, playing: false); self?.finished() }
+        backend = b
+    }
+    private func adopt(_ native: NativePlayback, index: MediaIndex, _ url: URL) {
+        adopt(native)
+        native.onDamaged = { [weak self, weak native] in if let native { self?.decodeDamaged(native, url) } }
+        duration = index.duration
+    }
+
+    /// Sound-only files: a large dim waveform where the picture would be, so the window isn't just black.
+    private func showSoundArt() {
+        let config = NSImage.SymbolConfiguration(pointSize: 96, weight: .light)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [NSColor(white: 1, alpha: 0.3)]))
+        guard let img = NSImage(systemSymbolName: "waveform", accessibilityDescription: "Audio")?.withSymbolConfiguration(config) else { return }
+        let scale = window?.backingScaleFactor ?? 2
+        var rect = NSRect(origin: .zero, size: img.size)
+        soundArt.contents = img.cgImage(forProposedRect: &rect, context: nil, hints: [.ctm: AffineTransform(scale: scale)])
+        soundArt.contentsScale = scale
+        soundArt.contentsGravity = .center
+        soundArt.frame = videoHost.bounds
+        videoHost.addSublayer(soundArt)
     }
 
     /// UI clock. 30 Hz only while something on screen moves with it (visible controls, captions);
@@ -526,6 +557,38 @@ final class PlayerView: NSView {
         clock = timer
     }
 
+    /// The hardware decoder gave up on damaged frames: carry on from the same moment with FFmpeg, which
+    /// conceals the damage and keeps the picture moving (the frame index and scrubbing stay as they are).
+    private func decodeDamaged(_ native: NativePlayback, _ url: URL) {
+        guard backend === native, !switchingToSoftware, !tornDown else { return }
+        switchingToSoftware = true
+        Task { @MainActor in
+            defer { switchingToSoftware = false }
+            guard let (v, a) = await Task.detached(operation: { FFPlayback.open(url) }).value,
+                  backend === native, !tornDown else { return }
+            // read now, not before the open: the sound kept playing, and the user may have paused meanwhile
+            let at = native.currentSeconds, playing = native.isPlaying
+            let ff = FFPlayback(video: v, audio: a)
+            ff.volume = native.volume; ff.isMuted = native.isMuted
+            ff.setRate(rate)
+            CATransaction.begin(); CATransaction.setDisableActions(true)
+            ff.layer.frame = videoHost.bounds
+            videoHost.insertSublayer(ff.layer, above: native.layer)
+            CATransaction.commit()
+            ff.seek(to: at) { [weak self, weak ff, weak native] _ in
+                guard let self, let ff, let native else { return }
+                native.teardown()
+                native.layer.removeFromSuperlayer()
+                if playing && self.backend === ff { ff.play(rate: self.rate) }
+            }
+            native.pause()
+            adopt(ff)
+            infoTask?.cancel(); infoTask = nil             // the info panel names the decoder: read again
+            if !infoPanel.isHidden { setInfo(true) }
+            Trace.log(String(format: "damaged frames at %.2f: now FFmpeg", at))
+        }
+    }
+
     private func finished() {
         if let u = loadedURL { PlaybackMemory.forget(u) }
         onFinished?()
@@ -541,8 +604,8 @@ final class PlayerView: NSView {
 
     func teardown() {
         savePosition()
+        tornDown = true
         infoTask?.cancel()
-        if let o = endObserver { NotificationCenter.default.removeObserver(o) }
         engine?.stop()
         clock?.invalidate()
         backend?.teardown()
@@ -588,9 +651,7 @@ final class PlayerView: NSView {
         backend?.cancelSeeks()
         pendingSettle = false
         target = d
-        CATransaction.begin(); CATransaction.setDisableActions(true)
-        scrubLayer.isHidden = false
-        CATransaction.commit()
+        setScrubVisible(true)
         engine.seek(frame: d)
         controls.setTime(index.seconds(d), playing: resumeAfterSeek)
         captionOverlay.update(time: index.seconds(d))
@@ -623,9 +684,7 @@ final class PlayerView: NSView {
         if pendingTrim == d {
             pendingTrim = nil
             target = nil
-            CATransaction.begin(); CATransaction.setDisableActions(true)
-            scrubLayer.isHidden = true
-            CATransaction.commit()
+            setScrubVisible(false)
         } else if pendingSettle {
             pendingSettle = false
             exactShown = d
@@ -636,7 +695,7 @@ final class PlayerView: NSView {
     /// The user stopped seeking: once the engine has the exact frame on screen, bring AVPlayer to the same
     /// frame and hand the screen back to it. Waiting keeps the two from fighting over the one hardware decoder.
     private func settle() {
-        guard let d = target, let index else { return }
+        guard let d = target, index != nil else { return }
         if exactShown != d { pendingSettle = true; return }
         let g = settleGen
         if !resumeAfterSeek {
@@ -670,9 +729,8 @@ final class PlayerView: NSView {
                     self.engine?.prefetch([])
                     self.engine?.setIdle(false)
                     self.backend?.play(rate: self.rate)
-                } else if let e = self.engine {
-                    let s = index.seconds(d)
-                    e.prefetch([s + 5, s - 5, s + 1, s - 1].filter { $0 >= 0 && $0 < index.duration }.map(index.frame(at:)))
+                } else if self.engine != nil {
+                    self.prefetchAround(index.seconds(d))
                     self.scheduleTrim()
                 }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
@@ -701,11 +759,26 @@ final class PlayerView: NSView {
     /// The controls stay up until it ends.
     private var swipeTarget: (seconds: Double, at: CFTimeInterval)?
 
+    /// The time of the picture on screen (the scrubbed frame while seeking, else the player's clock).
+    private var shownSeconds: Double { currentFrame.flatMap { index?.seconds($0) } ?? backend?.currentSeconds ?? 0 }
+    /// Playing, or mid-seek with play to resume.
+    private var playingOrResuming: Bool { target != nil ? resumeAfterSeek : backend?.isPlaying ?? false }
+    private func setScrubVisible(_ on: Bool) {
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        scrubLayer.isHidden = !on
+        CATransaction.commit()
+    }
+    /// Decode the frames a paused viewer most likely steps or skips to next.
+    private func prefetchAround(_ s: Double) {
+        guard let index, let engine else { return }
+        engine.prefetch([s + 5, s - 5, s + 1, s - 1].filter { $0 >= 0 && $0 < index.duration }.map(index.frame(at:)))
+    }
+
     private func swipe(_ by: Double) {
         guard pendingURL == nil, duration > 0 else { return }
         let now = CACurrentMediaTime()
         let from = swipeTarget.flatMap { now - $0.at < 0.4 ? $0.seconds : nil }
-            ?? currentFrame.flatMap { index?.seconds($0) } ?? backend?.currentSeconds ?? 0
+            ?? shownSeconds
         let t = max(0, min(duration - 0.001, from + by))
         swipeTarget = (t, now)
         showControls()
@@ -714,8 +787,7 @@ final class PlayerView: NSView {
 
     private func skip(_ by: Double) {
         guard pendingURL == nil else { return }
-        let base = currentFrame.flatMap { index?.seconds($0) } ?? backend?.currentSeconds ?? 0
-        seek(seconds: base + by, settleAfter: 0.25)
+        seek(seconds: shownSeconds + by, settleAfter: 0.25)
     }
 
     private func stepFrame(_ n: Int) {
@@ -760,16 +832,13 @@ final class PlayerView: NSView {
             backend?.pause()
             engine?.setIdle(true)
             scheduleTrim()
-            if let index, let e = engine {
-                let s = backend?.currentSeconds ?? 0
-                e.prefetch([s + 5, s - 5, s + 1, s - 1].filter { $0 >= 0 && $0 < index.duration }.map(index.frame(at:)))
-            }
+            prefetchAround(backend?.currentSeconds ?? 0)
         } else {
             engine?.prefetch([])
             engine?.setIdle(false)
             backend?.play(rate: rate)
         }
-        controls.setTime(controls.time, playing: target != nil ? resumeAfterSeek : backend?.isPlaying ?? false)
+        controls.setTime(controls.time, playing: playingOrResuming)
         if isPlayingNow { scheduleHide() } else { chrome(true, 0.12); savePosition() }
     }
 
@@ -792,6 +861,12 @@ final class PlayerView: NSView {
 
     private func changeVolume(_ by: Float) {
         guard let b = backend else { return }
+        // already at 100% and going up: carry on with the Mac's own volume
+        if by > 0, !b.isMuted, b.volume >= 0.999, let sys = SystemVolume.change(by: by) {
+            hud.alphaValue = 0
+            volumeBadge.show(sys, muted: false, in: bounds, system: true)
+            return
+        }
         b.volume = max(0, min(1, b.volume + by))
         if by != 0, b.isMuted { b.isMuted = false }
         hud.alphaValue = 0
@@ -881,7 +956,7 @@ final class PlayerView: NSView {
         case .embedded(let o): if let group { item?.select(o, in: group) }
         case .cues(_, let cues):
             captionOverlay.set(cues)
-            captionOverlay.update(time: currentFrame.flatMap { index?.seconds($0) } ?? backend?.currentSeconds ?? 0)
+            captionOverlay.update(time: shownSeconds)
         case .unsupported: captionChoice = nil
         }
     }
@@ -944,9 +1019,7 @@ final class PlayerView: NSView {
         resumeAfterSeek = false
         target = d
         pendingTrim = d
-        CATransaction.begin(); CATransaction.setDisableActions(true)
-        scrubLayer.isHidden = false
-        CATransaction.commit()
+        setScrubVisible(true)
         engine.setIdle(true)
         engine.seek(frame: d)
         engine.redisplay()
@@ -987,8 +1060,7 @@ final class PlayerView: NSView {
             item.title = "Play"
             return true
         case #selector(togglePlay):
-            let playing = target != nil ? resumeAfterSeek : backend?.isPlaying ?? false
-            item.title = playing ? "Pause" : "Play"
+            item.title = playingOrResuming ? "Pause" : "Play"
         case #selector(toggleMute(_:)): item.title = backend?.isMuted == true ? "Unmute" : "Mute"
         case #selector(toggleControllerVisibility(_:)): item.title = controlsHiddenByUser ? "Show Controls" : "Hide Controls"
         case #selector(nextVideo(_:)), #selector(previousVideo(_:)): return playlistCount() > 1
@@ -1068,7 +1140,6 @@ final class PlayerView: NSView {
             case "f": window?.toggleFullScreen(nil)
             case "i": toggleInfo(nil)
             case "\\", "l": onTogglePlaylist?()
-            case "m": if let b = backend { b.isMuted.toggle(); flash(hud, b.isMuted ? "Muted" : "Sound"); controls.setVolume(b.volume, muted: b.isMuted) }
             case "]": faster()
             case "[": slower()
             case "\u{7f}": normalSpeed()
@@ -1211,14 +1282,23 @@ final class PlayerView: NSView {
         f.lineBreakMode = .byTruncatingMiddle
         f.frame.size.width = w
         f.frame.origin.x = bounds.midX - w / 2
+        flashFades[ObjectIdentifier(f)]?.cancel()
+        flashFades[ObjectIdentifier(f)] = nil
+        // a fade still running from the last flash would otherwise finish after this one and hide it
+        NSAnimationContext.runAnimationGroup { $0.duration = 0; f.animator().alphaValue = 1 }
         f.alphaValue = 1
         if hold { return }
-        NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.6
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
-            f.animator().alphaValue = 0
-        })
+        let work = DispatchWorkItem { [weak f] in
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.5
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+                f?.animator().alphaValue = 0
+            })
+        }
+        flashFades[ObjectIdentifier(f)] = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: work)
     }
+    private var flashFades: [ObjectIdentifier: DispatchWorkItem] = [:]
 }
 
 /// A rounded message badge whose text sits in the middle of the box, vertically as well.
@@ -1367,10 +1447,15 @@ final class ControlBar: NSView {
     @objc private func tapMute() { onMute?() }
     @objc private func slideVolume() { onVolume?(Float(volume.doubleValue)) }
 
+    static func speakerSymbol(_ v: Float, muted: Bool) -> String {
+        let pct = Int((v * 100).rounded())
+        return muted || pct == 0 ? "speaker.slash.fill" : pct < 34 ? "speaker.wave.1.fill" : pct < 67 ? "speaker.wave.2.fill" : "speaker.wave.3.fill"
+    }
+
     /// Slider at the level, speaker glyph for the level (crossed out when muted).
     func setVolume(_ v: Float, muted: Bool) {
         if abs(volume.doubleValue - Double(v)) > 0.001 { volume.doubleValue = Double(v) }
-        let name = muted || v == 0 ? "speaker.slash.fill" : v < 0.34 ? "speaker.wave.1.fill" : v < 0.67 ? "speaker.wave.2.fill" : "speaker.wave.3.fill"
+        let name = Self.speakerSymbol(v, muted: muted)
         if muteButton.image?.accessibilityDescription != name {
             muteButton.image = NSImage(systemSymbolName: name, accessibilityDescription: name)?
                 .withSymbolConfiguration(.init(pointSize: 14, weight: .semibold))
@@ -1487,12 +1572,11 @@ final class VolumeBadge: NSView {
     required init?(coder: NSCoder) { fatalError() }
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
-    func show(_ v: Float, muted: Bool, in host: NSRect) {
+    func show(_ v: Float, muted: Bool, in host: NSRect, system: Bool = false) {
         let pct = Int((v * 100).rounded())
-        let name = muted || pct == 0 ? "speaker.slash.fill" : pct < 34 ? "speaker.wave.1.fill" : pct < 67 ? "speaker.wave.2.fill" : "speaker.wave.3.fill"
-        icon.image = NSImage(systemSymbolName: name, accessibilityDescription: nil)
-        label.stringValue = muted ? "Muted" : "\(pct)%"
-        let w: CGFloat = 112, h: CGFloat = 34
+        icon.image = NSImage(systemSymbolName: ControlBar.speakerSymbol(v, muted: muted), accessibilityDescription: nil)
+        label.stringValue = muted ? "Muted" : system ? "Mac \(pct)%" : "\(pct)%"
+        let w: CGFloat = system ? 132 : 112, h: CGFloat = 34
         // top centre, on the same line as the speed badge (30 pt tall, its bottom 80 pt below the top)
         frame = NSRect(x: (host.midX - w / 2).rounded(), y: host.maxY - 80 - (h - 30) / 2, width: w, height: h)
         icon.frame = NSRect(x: 10, y: 9, width: 22, height: 16)
@@ -1503,7 +1587,7 @@ final class VolumeBadge: NSView {
         CATransaction.commit()
         alphaValue = 1
         NSAccessibility.post(element: self, notification: .announcementRequested,
-                             userInfo: [.announcement: muted ? "Muted" : "Volume \(pct) percent", .priority: NSAccessibilityPriorityLevel.medium.rawValue])
+                             userInfo: [.announcement: muted ? "Muted" : system ? "Mac volume \(pct) percent" : "Volume \(pct) percent", .priority: NSAccessibilityPriorityLevel.medium.rawValue])
         hideWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
             NSAnimationContext.runAnimationGroup { $0.duration = 0.5; self?.animator().alphaValue = 0 }

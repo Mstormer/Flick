@@ -109,7 +109,6 @@ final class Thumbnailer: PreviewSource {
 final class PreviewBubble: NSView {
     private let picture = CALayer()
     private let label = NSTextField(labelWithString: "0:00")
-    private(set) var shownKey = -1
     var aspect: CGFloat = 16 / 9 { didSet { needsLayout = true } }
     static let width: CGFloat = 192
 
@@ -150,7 +149,6 @@ final class PreviewBubble: NSView {
         CATransaction.begin(); CATransaction.setDisableActions(true)
         picture.contents = img
         CATransaction.commit()
-        shownKey = img == nil ? -1 : key
     }
 
     func show(_ on: Bool) {

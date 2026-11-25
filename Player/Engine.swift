@@ -1,4 +1,5 @@
 import AVFoundation
+import UniformTypeIdentifiers
 import CoreMedia
 import VideoToolbox
 
@@ -35,10 +36,21 @@ final class MediaIndex {
     private let mappedLength: Int
     private let codec: CMVideoCodecType
     private let nalLen: Int
+    /// HEVC: how many temporal sub-layers the stream says it has (hvcC), 0 when it doesn't say.
+    private let temporalLayers: Int
     private let dropState: UnsafeMutablePointer<UInt8>   // 0 not read yet, 1 droppable, 2 referenced
 
+    /// Files whose samples sit whole and contiguous at the offsets the sample cursor reports: MP4/MOV/3GP.
+    /// MPEG program and transport streams (VOB, MPG, TS) split each frame into packets, so their ranges
+    /// aren't a frame's bytes; those play through AVPlayer without an index.
+    static func readsSamplesDirectly(_ url: URL) -> Bool {
+        guard let t = (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType ?? UTType(filenameExtension: url.pathExtension) else { return false }
+        return [UTType.mpeg4Movie, .quickTimeMovie, UTType("public.3gpp"), UTType("public.3gpp2")].compactMap { $0 }.contains { t.conforms(to: $0) }
+    }
+
     convenience init?(asset: AVURLAsset) async {
-        guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+        guard Self.readsSamplesDirectly(asset.url),
+              let track = try? await asset.loadTracks(withMediaType: .video).first,
               (try? await track.load(.canProvideSampleCursors)) == true,
               let fmt = try? await track.load(.formatDescriptions).first,
               let cursor = track.makeSampleCursorAtFirstSampleInDecodeOrder()
@@ -75,8 +87,10 @@ final class MediaIndex {
         guard let v = mkv.video, let pk = mkv.packets[v.number], !pk.isEmpty,
               let fmt = MKVCodecs.videoFormat(v, firstFrame: UnsafeRawBufferPointer(start: mkv.base + Int(pk[0].offset), count: Int(pk[0].size)))
         else { return nil }
-        let ts = Int32(clamping: 1_000_000_000 / max(1, mkv.timecodeScale))
-        let fixed = v.defaultDuration > 0 ? Int64((Double(v.defaultDuration) / Double(mkv.timecodeScale)).rounded()) : 0
+        // a timestamp unit that doesn't divide a second can't be a whole timescale: FFmpeg plays those (exact rationals)
+        guard 1_000_000_000 % mkv.timecodeScale == 0 else { return nil }
+        let ts = Int32(1_000_000_000 / mkv.timecodeScale)
+        let fixed = mkv.frameStep(v)
         // Durations from the gap to the next frame in presentation order when the track doesn't state one.
         let order = pk.indices.sorted { pk[$0].pts < pk[$1].pts }
         var dur = [Int64](repeating: fixed, count: pk.count)
@@ -99,6 +113,15 @@ final class MediaIndex {
 
     init?(url: URL, samples out: [Sample], timescale ts: Int32, format fmt: CMVideoFormatDescription) {
         var out = out
+        let fd = open(url.path, O_RDONLY)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        var st = stat()
+        fstat(fd, &st)
+        // a file cut short (an interrupted copy or download) lists frames past its end: reading them from the
+        // mapping would crash, so the index stops where the data does (and so does the timeline)
+        let size = Int64(st.st_size)
+        if let cut = out.firstIndex(where: { $0.offset < 0 || $0.offset + Int64($0.size) > size }) { out.removeSubrange(cut...) }
         guard !out.isEmpty else { return nil }
         if !out.contains(where: { $0.sync }) { for i in out.indices { out[i].sync = true } }
         out[0].sync = true
@@ -107,11 +130,6 @@ final class MediaIndex {
         var last: Int32 = 0
         for i in out.indices { if out[i].sync { last = Int32(i) }; sync[i] = last }
 
-        let fd = open(url.path, O_RDONLY)
-        guard fd >= 0 else { return nil }
-        defer { close(fd) }
-        var st = stat()
-        fstat(fd, &st)
         guard let p = mmap(nil, Int(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0), p != MAP_FAILED else { return nil }
 
         // Container rarely flags non-reference frames; the first slice NAL header says. It's read lazily
@@ -127,6 +145,8 @@ final class MediaIndex {
         }
         self.codec = codec
         self.nalLen = Int(nalLen)
+        let atoms = CMFormatDescriptionGetExtension(fmt, extensionKey: kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms) as? [String: Any]
+        temporalLayers = (atoms?["hvcC"] as? Data).flatMap { $0.count > 21 ? Int(($0[$0.startIndex + 21] >> 3) & 7) : nil } ?? 0
         dropState = .allocate(capacity: out.count)
         dropState.initialize(repeating: 0, count: out.count)
 
@@ -134,7 +154,7 @@ final class MediaIndex {
         byPTS = out.indices.sorted { out[$0].pts < out[$1].pts }.map(Int32.init)
         syncOf = sync
         timescale = ts
-        format = fmt
+        format = DisplayTone.format(fmt)          // so the decoded pictures aren't washed out (see DisplayTone)
         base = p
         mappedLength = Int(st.st_size)
         let lastS = out[Int(byPTS.last!)]
@@ -170,7 +190,10 @@ final class MediaIndex {
                     if type == 1 || type == 5 { drop = (h & 0x60) == 0; break }
                 } else {
                     let type = (h >> 1) & 0x3f
-                    if type < 32 { drop = type <= 14 && type % 2 == 0; break }
+                    // the "_N" picture types are unreferenced within their own temporal sub-layer only: higher
+                    // sub-layers may still use them (120/240 fps iPhone video), so only the top layer's can go
+                    let layer = Int(bytes[o + nalLen + 1] & 7)        // temporal id + 1
+                    if type < 32 { drop = type <= 14 && type % 2 == 0 && temporalLayers > 0 && layer >= temporalLayers; break }
                 }
                 o += nalLen + n
             }
@@ -207,16 +230,26 @@ final class MediaIndex {
         return g
     }
 
+    /// A decoder for this video, hardware where there is one, with pictures the display layers take as they are.
+    /// Real time for playback; not for scrubbing, where every frame must come out.
+    func makeSession(realTime: Bool) -> VTDecompressionSession? {
+        let spec = [kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: true] as CFDictionary
+        let attrs = [kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+                     kCVPixelBufferMetalCompatibilityKey: true] as CFDictionary
+        var s: VTDecompressionSession?
+        guard VTDecompressionSessionCreate(allocator: nil, formatDescription: format, decoderSpecification: spec,
+                                           imageBufferAttributes: attrs, outputCallback: nil,
+                                           decompressionSessionOut: &s) == noErr, let s else { return nil }
+        VTSessionSetProperty(s, key: kVTDecompressionPropertyKey_RealTime, value: realTime ? kCFBooleanTrue : kCFBooleanFalse)
+        return s
+    }
+
     func sampleBuffer(_ d: Int) -> CMSampleBuffer? {
         let s = samples[d]
-        var block: CMBlockBuffer?
-        guard CMBlockBufferCreateWithMemoryBlock(allocator: nil, memoryBlock: base + Int(s.offset),
-                                                 blockLength: Int(s.size), blockAllocator: kCFAllocatorNull,
-                                                 customBlockSource: nil, offsetToData: 0, dataLength: Int(s.size),
-                                                 flags: 0, blockBufferOut: &block) == noErr else { return nil }
+        guard let block = mappedBlock(base + Int(s.offset), Int(s.size)) else { return nil }
         var timing = CMSampleTimingInfo(duration: CMTime(value: s.dur, timescale: timescale),
                                         presentationTimeStamp: CMTime(value: s.pts, timescale: timescale),
-                                        decodeTimeStamp: s.dts == Int64.min ? .invalid : CMTime(value: s.dts, timescale: timescale))
+                                        decodeTimeStamp: CMTime(value: s.dts, timescale: timescale))
         var size = Int(s.size)
         var sb: CMSampleBuffer?
         CMSampleBufferCreateReady(allocator: nil, dataBuffer: block, formatDescription: format, sampleCount: 1,
@@ -352,17 +385,7 @@ final class ScrubEngine {
 
     /// Decoder sessions are created when seeking starts and released after a few idle seconds:
     /// each 4K session keeps a pool of decoded-frame buffers alive (~250 MB) for as long as it exists.
-    private static func makeLane(_ index: MediaIndex) -> Lane? {
-        let spec = [kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: true] as CFDictionary
-        let attrs = [kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
-                     kCVPixelBufferMetalCompatibilityKey: true] as CFDictionary
-        var s: VTDecompressionSession?
-        guard VTDecompressionSessionCreate(allocator: nil, formatDescription: index.format, decoderSpecification: spec,
-                                           imageBufferAttributes: attrs, outputCallback: nil,
-                                           decompressionSessionOut: &s) == noErr, let s else { return nil }
-        VTSessionSetProperty(s, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanFalse)
-        return Lane(s)
-    }
+    private static func makeLane(_ index: MediaIndex) -> Lane? { index.makeSession(realTime: false).map(Lane.init) }
 
     private func ensureLanes(_ n: Int) {
         while lanes.count < n, let l = ScrubEngine.makeLane(index) {
@@ -409,8 +432,6 @@ final class ScrubEngine {
         lock.unlock()
         wake.signal()
     }
-
-    var targetFrame: Int { current().0 }
 
     /// The scrub layer was cleared: show the target again even if it was already on screen.
     func redisplay() {

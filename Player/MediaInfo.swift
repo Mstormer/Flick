@@ -399,7 +399,7 @@ extension Array {
     subscript(safe i: Int) -> Element? { indices.contains(i) ? self[i] : nil }
 }
 
-/// The info overlay (top left): sections of label/value rows on a dark rounded panel.
+/// The info overlay (top right): sections of label/value rows on a dark rounded panel.
 final class InfoPanel: NSView {
     private let text = NSTextField(wrappingLabelWithString: "")
     private let effect = NSVisualEffectView()

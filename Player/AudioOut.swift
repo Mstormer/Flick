@@ -60,8 +60,10 @@ final class AudioDecoder {
                 pending = nil
                 guard let buf = Self.buffer(sb, input) else { outStatus.pointee = .noDataNow; return nil }
                 if next == nil {
-                    next = CMSampleBufferGetPresentationTimeStamp(sb).seconds - source.codecDelay
-                    skip = max(0, Int(((target - next!) * output.sampleRate).rounded()))
+                    // a broken timestamp is taken as the target: Int() of NaN or infinity would trap
+                    let t = CMSampleBufferGetPresentationTimeStamp(sb).seconds - source.codecDelay
+                    next = t.isFinite ? t : target
+                    skip = Int(min(1e9, max(0, ((target - next!) * output.sampleRate).rounded())))
                 }
                 fed = true
                 outStatus.pointee = .haveData
@@ -81,9 +83,6 @@ final class AudioDecoder {
         }
         return nil
     }
-
-    /// Media time just after the last frame handed out.
-    var position: Double? { next }
 
     private static func dropFront(_ b: AVAudioPCMBuffer, _ n: Int) {
         guard let d = b.floatChannelData else { return }
@@ -228,6 +227,9 @@ final class AudioOut {
         engine.stop()
     }
 
+    /// Top up the scheduled audio on the owner's queue (after a rate change).
+    func topUp() { q.async { [self] in fill(gen) } }
+
     /// Keep about half a second (at the current rate) scheduled.
     private func fill(_ g: Int) {
         guard g == gen else { return }
@@ -305,6 +307,8 @@ final class SyncedAudio {
     /// so they never run ahead of or behind the sound.
     func setRate(_ r: Float, playing: Bool) {
         out.rate = r
+        // faster, the scheduled sound drains sooner: top it up now rather than when its next buffer is consumed
+        out.topUp()
         guard playing else { return }
         later(out.latency) { [sync] in sync.setRate(r, time: sync.currentTime()) }
     }
