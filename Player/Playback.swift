@@ -321,7 +321,7 @@ final class NativePlayback: Playback {
     }
 
     /// A plain MP4/MOV (one video track, at most one audio track, no embedded subtitles, no rotation, SDR)
-    /// plays here too; anything fancier stays with AVPlayer. `defaults write app.flick.player avplayer -bool YES`
+    /// plays here too; anything fancier stays with AVPlayer. `defaults write com.amplifyinteractions.flick avplayer -bool YES`
     /// sends everything to AVPlayer.
     static func make(asset: AVURLAsset) async -> (NativePlayback, MediaIndex)? {
         guard !UserDefaults.standard.bool(forKey: "avplayer"),

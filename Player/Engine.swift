@@ -366,7 +366,7 @@ final class ScrubEngine {
     private let outLock = NSLock()
     private var shown = -1                 // decode index currently on screen
     /// Decoded-frame cache. A 4K frame is ~15 MB, so this is the main memory cost of fast seeking.
-    /// `defaults write app.flick.player cacheMB <n>` overrides the default for experiments.
+    /// `defaults write com.amplifyinteractions.flick cacheMB <n>` overrides the default for experiments.
     static let defaultCacheMB = 32
     private let cache: FrameCache = {
         let mb = UserDefaults.standard.integer(forKey: "cacheMB")

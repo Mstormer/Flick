@@ -4,6 +4,9 @@ set -e
 cd "${0:A:h}"
 APP=build/Flick.app
 FF=Vendor/ffmpeg
+# FLICK_SIGN_IDENTITY="Developer ID Application: …" signs for distribution (hardened runtime, secure timestamp, Tools/Flick.entitlements);
+# without it the build is ad-hoc signed for this Mac only. Tools/notarize.sh then notarizes it (see SECURITY.md).
+if [[ -n $FLICK_SIGN_IDENTITY ]]; then SIGN=(codesign --force --options runtime --timestamp -s "$FLICK_SIGN_IDENTITY"); else SIGN=(codesign --force -s -); fi
 [[ -f $FF/lib/libavcodec.dylib ]] || Tools/build-ffmpeg.sh
 rm -rf $APP; mkdir -p $APP/Contents/{MacOS,Resources,Frameworks}
 swiftc -O -swift-version 5 -target arm64-apple-macos14 -o $APP/Contents/MacOS/Flick Player/*.swift \
@@ -12,7 +15,7 @@ swiftc -O -swift-version 5 -target arm64-apple-macos14 -o $APP/Contents/MacOS/Fl
 for l in libavformat.63 libavcodec.63 libavutil.61 libswscale.10 libswresample.7; do
   cp -L $FF/lib/$l.dylib $APP/Contents/Frameworks/
   strip -x $APP/Contents/Frameworks/$l.dylib
-  codesign -s - --force $APP/Contents/Frameworks/$l.dylib
+  "${SIGN[@]}" $APP/Contents/Frameworks/$l.dylib
 done
 # the license notice carries the exact FFmpeg build configuration (with local paths made relative)
 # (the tree of the version build-ffmpeg.sh builds: an older extracted tree would add its own, stale line)
@@ -28,11 +31,11 @@ cat > $APP/Contents/Info.plist <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>CFBundleName</key><string>Flick</string>
-<key>CFBundleIdentifier</key><string>app.flick.player</string>
+<key>CFBundleIdentifier</key><string>com.amplifyinteractions.flick</string>
 <key>CFBundleExecutable</key><string>Flick</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.2.8</string>
-<key>CFBundleVersion</key><string>10</string>
+<key>CFBundleShortVersionString</key><string>0.2.9</string>
+<key>CFBundleVersion</key><string>11</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
@@ -163,5 +166,6 @@ cat > $APP/Contents/Info.plist <<PLIST
 </array>
 </dict></plist>
 PLIST
-codesign -s - --force $APP
+"${SIGN[@]}" --entitlements Tools/Flick.entitlements $APP
+codesign --verify --strict $APP
 echo built $APP

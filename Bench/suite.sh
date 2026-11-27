@@ -33,8 +33,8 @@ skip() {
 }
 
 # The play tests change Flick's remembered speed; put the user's back at the end.
-FLICK_RATE=$(defaults read app.flick.player rate 2>/dev/null)
-restore_rate() { [[ -n $FLICK_RATE ]] && defaults write app.flick.player rate -float $FLICK_RATE || defaults delete app.flick.player rate 2>/dev/null; true; }
+FLICK_RATE=$(defaults read com.amplifyinteractions.flick rate 2>/dev/null)
+restore_rate() { [[ -n $FLICK_RATE ]] && defaults write com.amplifyinteractions.flick rate -float $FLICK_RATE || defaults delete com.amplifyinteractions.flick rate 2>/dev/null; true; }
 trap 'closeall; restore_rate; log "stopped"; exit 130' INT TERM
 
 swiftc -O -swift-version 5 -o bench bench.swift 2>&1 | grep error: && { log "bench failed to build"; exit 1; }

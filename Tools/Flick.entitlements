@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<!-- The only hardened-runtime exception: the FFmpeg libraries in Contents/Frameworks ship separately so users can replace
+     them with their own build (LGPL), and a replacement carries another signature. Nothing else is needed: no network,
+     no camera or microphone, no JIT, no Apple Events. Not sandboxed (a Developer ID build outside the App Store). -->
+<key>com.apple.security.cs.disable-library-validation</key><true/>
+</dict></plist>

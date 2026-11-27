@@ -67,4 +67,6 @@ Adding a format touches several places that must agree: the `--enable-demuxer`/`
 - The code is deliberately dense: long lines, short names, and comments that say why in plain words. Keep that style; don't reformat.
 - Every command must be reachable from the menu bar (`Menus.swift`); user shortcuts are the table in `Settings.swift`.
 - The version and build number are in the Info.plist inside `make-app.sh`.
+- Bundle identifier: `com.amplifyinteractions.flick` (owner, 2026-11-25: every app is `com.amplifyinteractions.<appname>`; Flick was `app.flick.player` until 0.2.9, and `Player/main.swift` migrates the old defaults once).
+- Releases: `FLICK_SIGN_IDENTITY=… ./make-app.sh`, then `FLICK_SIGN_IDENTITY=… FLICK_NOTARY_PROFILE=flick-notary Tools/notarize.sh` (Developer ID, hardened runtime, notarized and stapled; see SECURITY.md). The owner makes all certificates, keys and passwords.
 - Commit messages are past tense ("Added X"), and commits are made only when asked.

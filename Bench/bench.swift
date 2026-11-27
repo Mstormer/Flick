@@ -38,7 +38,7 @@ let launch: Launch = {
     case "IINA": return Launch(ownerName: "IINA", bundleID: "com.colliderli.iina")
     case "VLC": return Launch(ownerName: "VLC", bundleID: "org.videolan.vlc")
     case "Leah": return Launch(ownerName: "Leah", bundleID: nil)
-    default: return Launch(ownerName: "Flick", bundleID: "app.flick.player")
+    default: return Launch(ownerName: "Flick", bundleID: "com.amplifyinteractions.flick")
     }
 }()
 
